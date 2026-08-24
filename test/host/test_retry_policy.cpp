@@ -1,0 +1,108 @@
+// Host test: plain C++, no Arduino. §21-§26/§51.
+#include <cstdio>
+
+#include "../../firmware/kiosk_runtime_v2/src/protocol/retry_policy.h"
+
+namespace {
+int g_failures = 0;
+void check(bool condition, const char* description) {
+  std::printf("  %s: %s\n", condition ? "PASS" : "FAIL", description);
+  if (!condition) ++g_failures;
+}
+}  // namespace
+
+int main() {
+  using namespace kiosk::protocol;
+
+  std::printf("test_retry_policy\n");
+
+  // --- Classification ---
+  {
+    auto ok = classify_http_result(200);
+    check(ok.ok && ok.error_code.empty(), "200 -> ok, no error_code");
+
+    auto timeout = classify_http_result(-11);
+    check(!timeout.ok && timeout.error_code == "NET_TIMEOUT" && timeout.retryable,
+          "-11 (read timeout) -> NET_TIMEOUT, retryable");
+
+    auto hard_deadline = classify_http_result(-999);
+    check(!hard_deadline.ok && hard_deadline.error_code == "NET_TIMEOUT" && hard_deadline.retryable,
+          "-999 (our hard-deadline marker) -> NET_TIMEOUT, retryable");
+
+    auto refused = classify_http_result(-1);
+    check(refused.error_code == "NET_CONNECT_REFUSED" && refused.retryable,
+          "-1 (connection refused) -> NET_CONNECT_REFUSED, retryable");
+
+    auto bad_request = classify_http_result(400);
+    check(!bad_request.retryable && bad_request.error_code == "API_HTTP_4XX",
+          "400 -> API_HTTP_4XX, NOT retryable (no blind retry)");
+
+    auto unauthorized = classify_http_result(401);
+    check(!unauthorized.retryable, "401 -> not retryable");
+
+    auto forbidden = classify_http_result(403);
+    check(!forbidden.retryable, "403 -> not retryable");
+
+    auto server_error = classify_http_result(500);
+    check(server_error.retryable && server_error.error_code == "API_HTTP_5XX",
+          "500 -> API_HTTP_5XX, retryable");
+    auto unavailable = classify_http_result(503);
+    check(unavailable.retryable && unavailable.error_code == "API_HTTP_5XX", "503 -> API_HTTP_5XX, retryable");
+
+    auto rate_limited = classify_http_result(429, 30);
+    check(rate_limited.retryable && rate_limited.error_code == "API_RATE_LIMITED" &&
+              rate_limited.retry_after_s == 30,
+          "429 with Retry-After: 30 -> API_RATE_LIMITED, retryable, retry_after_s=30");
+
+    auto rate_limited_no_header = classify_http_result(429);
+    check(rate_limited_no_header.retryable && rate_limited_no_header.retry_after_s == 0,
+          "429 without Retry-After -> still retryable, retry_after_s=0 (caller falls back to normal backoff)");
+  }
+
+  // --- Backoff bounds ---
+  {
+    uint32_t b1 = compute_backoff_ms(1, 1000, 30000, 0);
+    uint32_t b2 = compute_backoff_ms(2, 1000, 30000, 0);
+    uint32_t b3 = compute_backoff_ms(3, 1000, 30000, 0);
+    check(b1 == 1000, "attempt 1, no jitter -> base (1000ms)");
+    check(b2 == 2000, "attempt 2, no jitter -> 2x base (2000ms)");
+    check(b3 == 4000, "attempt 3, no jitter -> 4x base (4000ms)");
+
+    uint32_t b_capped = compute_backoff_ms(10, 1000, 30000, 0);
+    check(b_capped == 30000, "high attempt count caps at max_ms (30000ms) with no jitter");
+
+    uint32_t b_jitter_max = compute_backoff_ms(1, 1000, 30000, 25, 25);
+    check(b_jitter_max == 1250, "attempt 1, jitter=25(of max 25) -> base + 25% = 1250ms");
+
+    uint32_t b_capped_jitter = compute_backoff_ms(10, 1000, 30000, 25, 25);
+    check(b_capped_jitter <= 30000 + 30000 / 4,
+          "capped backoff + max jitter never exceeds max_ms + jitter_pct_max%%");
+
+    bool bounds_ok = true;
+    for (int attempt = 1; attempt <= 15; ++attempt) {
+      for (uint32_t jitter = 0; jitter <= 100; jitter += 10) {
+        uint32_t v = compute_backoff_ms(attempt, 1000, 30000, jitter, 25);
+        if (v < 1000 || v > 30000 + 30000 / 4) bounds_ok = false;
+      }
+    }
+    check(bounds_ok, "backoff stays within [base, max+25%%] across a sweep of attempts/jitter values");
+  }
+
+  // --- Retry-After parsing ---
+  {
+    auto r1 = parse_retry_after("30");
+    check(r1.present && r1.seconds == 30, "numeric Retry-After parses correctly");
+
+    auto r2 = parse_retry_after("");
+    check(!r2.present, "empty Retry-After -> not present");
+
+    auto r3 = parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT");
+    check(!r3.present, "HTTP-date Retry-After form -> not present (honestly unsupported, not guessed)");
+
+    auto r4 = parse_retry_after("0");
+    check(r4.present && r4.seconds == 0, "Retry-After: 0 parses as present, 0 seconds");
+  }
+
+  std::printf("%s (%d failure(s))\n", g_failures == 0 ? "OK" : "FAILED", g_failures);
+  return g_failures == 0 ? 0 : 1;
+}

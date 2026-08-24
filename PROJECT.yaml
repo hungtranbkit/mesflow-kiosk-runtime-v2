@@ -1,0 +1,69 @@
+name: mesflow-kiosk-runtime-v2
+description: >
+  Clean-room ESP32-S3 kiosk runtime. Hardware = renderer + local cache +
+  offline journal + secure transport. Backend (MESFlow) = source of truth,
+  workflow, business state, UI authoring, policy, device management.
+  Independent of the legacy esp-kiosk firmware (mesflow/esp-kiosk); that
+  project is read-only reference material and continues to run unmodified.
+
+version_source: VERSION
+
+phase: 2
+phase_name: "Server Authoritative State + Workflow Contract"
+
+target_hardware:
+  chip: ESP32-S3
+  flash_mb: 16
+  psram: "octal (opi), 8MB confirmed via esptool chip probe and live heap_caps queries"
+  display: ILI9341 240x320 (SPI)
+  scanner: GM65 (UART, one-way RX, 9600 8N1)
+  keypad: PCF8574T (I2C, 3x4 matrix)
+  touch: FT6336G (I2C, capacitive) — present on legacy board, not yet driven in v2
+  speaker: none observed on legacy board
+
+framework:
+  name: Arduino (esp32 core)
+  reason: >
+    ESP-IDF is not installed in this environment and no IDF_PATH is set.
+    arduino-cli with esp32:esp32 core 3.3.11 is already installed and has
+    a proven build for this exact chip/board (legacy esp-kiosk builds with
+    it). All required libraries (Adafruit_GFX, Adafruit_ILI9341, ArduinoJson,
+    WiFi/HTTPClient/Preferences) are already present. Using it avoids an
+    unverified, lengthy toolchain install for Phase 0 and lets "does it
+    build" be answered immediately. Business/protocol/state logic is kept
+    framework-agnostic (plain C++, no Arduino.h) in src/protocol/ so a later
+    move to ESP-IDF only touches the hardware/network adapter layer.
+  fqbn: "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=default_8MB,PSRAM=opi,CDCOnBoot=cdc"
+
+build:
+  tool: arduino-cli
+  sketch: firmware/kiosk_runtime_v2
+  command: scripts/build.sh   # equivalent to scripts/build-dev.sh
+  profiles:
+    dev: scripts/build-dev.sh    # firmware/kiosk_runtime_v2/build-dev/
+    prod: scripts/build-prod.sh  # firmware/kiosk_runtime_v2/build-prod/, /debug/* compiled out entirely
+
+test:
+  host:
+    tool: g++ (no ESP toolchain required)
+    command: scripts/run_host_tests.sh
+
+smoke:
+  command: scripts/monitor.sh
+  expect: >
+    Boot diagnostics line, display init OK, scanner init OK, keypad init
+    OK/DEGRADED, event bus alive, one mock event POSTed if Wi-Fi + mock
+    backend reachable.
+
+flash:
+  command: scripts/flash.sh
+  guard: >
+    Do NOT run against a board that runs firmware the user depends on.
+    Confirm the target device explicitly before flashing.
+
+artifact:
+  path: firmware/kiosk_runtime_v2/build-dev/esp32.esp32.esp32s3/kiosk_runtime_v2.ino.bin
+
+legacy:
+  path: mesflow/esp-kiosk
+  policy: read-only reference only; never modified, renamed, or built from this project

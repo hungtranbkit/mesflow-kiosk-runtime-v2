@@ -1,0 +1,29 @@
+firmware/kiosk_runtime_v2/build/
+firmware/kiosk_runtime_v2/build-dev/
+firmware/kiosk_runtime_v2/build-prod/
+# Any other sketch's build output (e.g. firmware/lcd_swap_display_test/build/,
+# a hardware bring-up test sketch) -- same arduino-cli-generated-output
+# reasoning as kiosk_runtime_v2's own build dirs above, just not named yet
+# per-sketch. A real ~32MB of .bin/.elf/.map/sdkconfig almost got committed
+# here once (caught before ever pushing this repo).
+firmware/*/build/
+firmware/**/*.bin
+firmware/**/*.elf
+firmware/**/*.map
+test/host/build/
+*.o
+.DS_Store
+__pycache__/
+*.pyc
+artifacts/debug/
+# Same debug-capture output, but tools/test_ui_bundle_redraw_regression.py's
+# --out default is a RELATIVE path -- if ever run with cwd=tools/ instead of
+# the repo root, it lands here instead of the top-level artifacts/debug/
+# above (real mistake made once, caught before ever pushing this repo).
+tools/artifacts/
+# Timestamped/QA-* e2e run OUTPUT (baseline.json/summary.*) -- generated per
+# run, same "not source" reasoning as artifacts/debug/ above. artifacts/e2e/qr/
+# (reusable QR fixtures) and artifacts/golden/ (reference screenshots) are
+# real fixtures/source and stay tracked.
+artifacts/e2e/[0-9]*/
+artifacts/e2e/QA-*/
