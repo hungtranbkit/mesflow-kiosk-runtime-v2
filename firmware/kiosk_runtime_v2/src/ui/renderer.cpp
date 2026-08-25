@@ -340,6 +340,53 @@ void Renderer::draw_title_2line(const String& line1, const String& line2, int16_
   draw_title_line(line2, y_top + kLineHeightLarge, color);
 }
 
+// Shared word-wrap-into-at-most-2-lines-then-ellipsize algorithm (2026-08-25
+// bundle-text-clip fix: factored out of draw_fit_text() so draw_from_bundle()
+// can apply the same policy at an arbitrary font_size, not just kFontSmall).
+// Splits at the last space that keeps line 1 within max_w; with no such
+// space (one unbreakable token wider than the screen -- e.g. a RecoveryCode
+// like "RECOVERY_TASK_CREATE_FAILED" with no spaces at all, caught live on
+// real hardware during the 2026-08-25 UI cleanup), *out_line1 = text and
+// *out_line2 stays empty -- there's nothing left to wrap to a second line.
+// Both output lines are ellipsized independently afterward if they still
+// don't fit (3+ lines' worth of real content, or a still-too-wide token).
+void Renderer::wrap_and_ellipsize_two_lines(const String& text, uint8_t font_size, int16_t max_w,
+                                            String* out_line1, String* out_line2) {
+  String remaining = text;
+  String line1, line2;
+  int space_at = -1;
+  for (unsigned int i = 0; i < remaining.length(); ++i) {
+    if (remaining[i] == ' ') {
+      String candidate = remaining.substring(0, i);
+      if (measure_text_width(candidate, font_size) <= static_cast<uint16_t>(max_w)) {
+        space_at = static_cast<int>(i);
+      } else {
+        break;
+      }
+    }
+  }
+  if (space_at >= 0) {
+    line1 = remaining.substring(0, space_at);
+    line2 = remaining.substring(space_at + 1);
+  } else {
+    line1 = remaining;
+    line2 = "";
+  }
+  auto ellipsize_if_needed = [&](String& line) {
+    if (line.length() == 0 || measure_text_width(line, font_size) <= static_cast<uint16_t>(max_w)) return;
+    // Trim to fit + ellipsis, character by character (bounded: len(line) iterations max).
+    while (line.length() > 1 &&
+           measure_text_width(line + "...", font_size) > static_cast<uint16_t>(max_w)) {
+      line = line.substring(0, line.length() - 1);
+    }
+    line += "...";
+  };
+  ellipsize_if_needed(line1);
+  ellipsize_if_needed(line2);
+  *out_line1 = line1;
+  *out_line2 = line2;
+}
+
 // Shared fit policy (§9 of the task) for VARIABLE-length content (employee/
 // operation names, server/error messages): try LARGE on one line, then
 // SMALL on one line, then wrap to at most 2 SMALL lines (word boundary,
@@ -357,46 +404,8 @@ void Renderer::draw_fit_text(const String& text, int16_t y_top, uint16_t color, 
     emit_component_text(centered_x(text, kFontSmall), y_top, text, color, kFontSmall);
     return;
   }
-  // Word-wrap at SMALL into at most 2 lines; ellipsis the 2nd if it still
-  // doesn't fit (an unbroken token wider than the screen, or 3+ lines' worth
-  // of real content -- either way, never silently clip past the display).
-  String remaining = text;
   String line1, line2;
-  int space_at = -1;
-  for (unsigned int i = 0; i < remaining.length(); ++i) {
-    if (remaining[i] == ' ') {
-      String candidate = remaining.substring(0, i);
-      if (measure_text_width(candidate, kFontSmall) <= static_cast<uint16_t>(max_w)) {
-        space_at = static_cast<int>(i);
-      } else {
-        break;
-      }
-    }
-  }
-  if (space_at >= 0) {
-    line1 = remaining.substring(0, space_at);
-    line2 = remaining.substring(space_at + 1);
-  } else {
-    // A single unbreakable token wider than the screen (e.g. a
-    // RecoveryCode like "RECOVERY_TASK_CREATE_FAILED" with no spaces at
-    // all) -- caught live on real hardware (2026-08-25 UI cleanup:
-    // draw_safe_mode_screen()'s reason_code overflowed by 51px before this
-    // fix). Ellipsis line1 itself rather than silently overflowing; line2
-    // stays empty, there's nothing left to wrap to a second line.
-    line1 = remaining;
-    line2 = "";
-  }
-  auto ellipsize_if_needed = [&](String& line) {
-    if (line.length() == 0 || measure_text_width(line, kFontSmall) <= static_cast<uint16_t>(max_w)) return;
-    // Trim to fit + ellipsis, character by character (bounded: len(line) iterations max).
-    while (line.length() > 1 &&
-           measure_text_width(line + "...", kFontSmall) > static_cast<uint16_t>(max_w)) {
-      line = line.substring(0, line.length() - 1);
-    }
-    line += "...";
-  };
-  ellipsize_if_needed(line1);
-  ellipsize_if_needed(line2);
+  wrap_and_ellipsize_two_lines(text, kFontSmall, max_w, &line1, &line2);
   emit_component_text(centered_x(line1, kFontSmall), y_top, line1, color, kFontSmall);
   if (line2.length() > 0) {
     emit_component_text(centered_x(line2, kFontSmall), y_top + kLineHeightSmall, line2, color, kFontSmall);
@@ -803,12 +812,31 @@ void Renderer::draw_from_bundle(const kiosk::protocol::UiScreen& screen,
         // wire contract -- see select_vn_font()'s own comment) with the
         // same auto-shrink-to-fit-when-centered behavior as before.
         uint8_t effective_size = comp.font_size == 0 ? 1 : comp.font_size;
+        const int16_t max_w = display_.width() - 8;
         if (comp.align == "center") {
-          int16_t max_w = display_.width() - 8;
           while (effective_size > 1 &&
                  measure_text_width(resolved_str, effective_size) > static_cast<uint16_t>(max_w)) {
             --effective_size;
           }
+        }
+        // 2026-08-25 bundle-text-clip fix: shrinking alone can still leave
+        // centered text wider than the screen even at the smallest size
+        // (found live: a long server-pushed operation name silently clipped
+        // mid-word on state_session_active, bundle v10 -- the bundle JSON
+        // itself was correct, font_size:2/align:center, this shrink-only
+        // loop just had no floor). Same wrap-then-ellipsize policy
+        // draw_fit_text() already uses for hardcoded screens, applied here
+        // at whatever effective_size the shrink loop landed on.
+        if (comp.align == "center" &&
+            measure_text_width(resolved_str, effective_size) > static_cast<uint16_t>(max_w)) {
+          String line1, line2;
+          wrap_and_ellipsize_two_lines(resolved_str, effective_size, max_w, &line1, &line2);
+          emit_component_text(centered_x(line1, effective_size), comp.y, line1, color, effective_size);
+          if (line2.length() > 0) {
+            emit_component_text(centered_x(line2, effective_size), comp.y + kLineHeightSmall, line2, color,
+                                effective_size);
+          }
+          break;
         }
         int16_t x = comp.x;
         if (comp.align == "center") {

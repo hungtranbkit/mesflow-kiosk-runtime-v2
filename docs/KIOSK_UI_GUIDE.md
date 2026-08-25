@@ -145,8 +145,12 @@ see `docs/UI_SCHEMA.md`'s corrected status note) can override any
 `draw_from_bundle()`. Bundle `TEXT` components declare their own
 `font_size` (backward-compatible wire contract, any 1-N still decodes) and
 may set `"align":"center"`, which the renderer honors by computing `x`
-itself and auto-shrinking `font_size` on overflow (same `centered_x()`
-path the hardcoded screens use). `tools/mock_backend/mock_backend.py`'s
+itself, auto-shrinking `font_size` on overflow (same `centered_x()` path
+the hardcoded screens use), and — if it's STILL too wide even at the
+smallest size (2026-08-25 fix, found live with a long server-pushed
+operation name) — wrapping to a second line and ellipsizing via the same
+`wrap_and_ellipsize_two_lines()` policy `draw_fit_text()` uses, never a
+silent clip. `tools/mock_backend/mock_backend.py`'s
 `UI_BUNDLE_CONTENT[3]` (the default bundle version) mirrors the current
 2-size/centered hardcoded design exactly, via its own `_c()` helper —
 that's the reference to copy from when authoring a new bundle screen.

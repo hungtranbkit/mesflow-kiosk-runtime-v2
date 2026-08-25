@@ -310,6 +310,17 @@ class Renderer {
   uint16_t measure_text_width(const String& text, uint8_t font_size);
   // x for a string centered in the full display width at the given size.
   int16_t centered_x(const String& text, uint8_t font_size);
+  // Shared word-wrap-into-at-most-2-lines-then-ellipsize algorithm, factored
+  // out of draw_fit_text() (2026-08-25 bundle-text-clip fix) so
+  // draw_from_bundle() can apply the exact same "never a silent clip"
+  // policy to server-pushed centered text at whatever font_size its own
+  // auto-shrink loop landed on, not just the hardcoded screens' fixed
+  // kFontSmall. Splits at the last space that keeps line 1 within max_w;
+  // with no such space (one unbreakable token wider than the screen),
+  // line1=text/line2="" and line1 alone gets ellipsized. Both output lines
+  // are ellipsized independently if they still don't fit after the split.
+  void wrap_and_ellipsize_two_lines(const String& text, uint8_t font_size, int16_t max_w,
+                                    String* out_line1, String* out_line2);
   // Call once a screen is fully drawn -- bumps Display's frame_id so a
   // debug capture can tell whether the screen changed between two requests.
   void end_screen();
