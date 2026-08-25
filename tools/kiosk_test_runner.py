@@ -61,11 +61,25 @@ INVALID_REWORK = {"good": 20, "defect": 3, "rework": 4}  # must be rejected, nev
 
 
 class KioskTestRunner:
-    def __init__(self, port=DEFAULT_PORT, evidence_dir=None):
+    # 2026-08-25 connectivity-recovery task: the QR fixtures and DB
+    # container/name were originally fixed module constants (LOCAL-TEST
+    # only). Made instance-level, defaulting to those same LOCAL-TEST
+    # values, so every existing caller is unaffected -- overriding them is
+    # opt-in via KioskTestRunner(...)/--emp-qr/--op-qr/--db-container/
+    # --db-name, needed to point this same engine at PROD-TEST's real
+    # fixtures (different QR codes, different DB container) instead of
+    # LOCAL-TEST's.
+    def __init__(self, port=DEFAULT_PORT, evidence_dir=None, emp_qr=EMP_QR, op_qr=OP_QR,
+                db_container=DB_CONTAINER, db_name=DB_NAME, db_user=DB_USER):
         self.ser = serial.Serial(port, 115200, timeout=3)
         time.sleep(1)
         self.evidence_dir = evidence_dir
         self.log = []
+        self.emp_qr = emp_qr
+        self.op_qr = op_qr
+        self.db_container = db_container
+        self.db_name = db_name
+        self.db_user = db_user
 
     def close(self):
         self.ser.close()
@@ -130,10 +144,10 @@ class KioskTestRunner:
         # state projection") -- finish it deliberately through the real
         # runtime instead, same as a real operator would.
         if biz == "WAIT_OPERATION":
-            self.scan(OP_QR, "SESSION_ACTIVE")
+            self.scan(self.op_qr, "SESSION_ACTIVE")
             biz = "SESSION_ACTIVE"
         if biz == "SESSION_ACTIVE":
-            self.scan(EMP_QR, "QUANTITY_INPUT")
+            self.scan(self.emp_qr, "QUANTITY_INPUT")
             biz = "QUANTITY_INPUT"
         if biz == "QUANTITY_INPUT":
             self.keys("0", "#")  # GOOD=0
@@ -142,10 +156,9 @@ class KioskTestRunner:
         return self.wait_biz("WAIT_EMPLOYEE", timeout=60)
 
     # --- Postgres assertions ---
-    @staticmethod
-    def db_query(sql):
+    def db_query(self, sql):
         out = subprocess.run(
-            ["docker", "exec", DB_CONTAINER, "psql", "-U", DB_USER, "-d", DB_NAME,
+            ["docker", "exec", self.db_container, "psql", "-U", self.db_user, "-d", self.db_name,
              "-t", "-A", "-F,", "-c", sql],
             capture_output=True, text=True, timeout=15)
         return [line.split(",") for line in out.stdout.strip().split("\n") if line]
@@ -197,10 +210,10 @@ class KioskTestRunner:
         ds = self.state()
         version_before = ds["state"]["state_version"]
 
-        self.scan(EMP_QR, "WAIT_OPERATION")
-        ds = self.scan(OP_QR, "SESSION_ACTIVE")
+        self.scan(self.emp_qr, "WAIT_OPERATION")
+        ds = self.scan(self.op_qr, "SESSION_ACTIVE")
         session_id_str = ds["state"]["view"].get("session_id", "")
-        self.scan(EMP_QR, "QUANTITY_INPUT")
+        self.scan(self.emp_qr, "QUANTITY_INPUT")
 
         self.keys(*list(str(good)), "#")
         self.keys(*list(str(defect)), "#")
@@ -246,10 +259,10 @@ class KioskTestRunner:
         q = INVALID_REWORK
         self.ensure_clean_state()
 
-        self.scan(EMP_QR, "WAIT_OPERATION")
-        self.scan(OP_QR, "SESSION_ACTIVE")  # legitimately creates one new work_sessions row -- must not be
+        self.scan(self.emp_qr, "WAIT_OPERATION")
+        self.scan(self.op_qr, "SESSION_ACTIVE")  # legitimately creates one new work_sessions row -- must not be
                                              # counted against the invalid-attempt-creates-nothing check below
-        self.scan(EMP_QR, "QUANTITY_INPUT")
+        self.scan(self.emp_qr, "QUANTITY_INPUT")
         # Sampled HERE, not before the scans above (2026-08-25 fix -- the
         # old count_before was taken before SESSION_ACTIVE's own legitimate
         # session creation, so count_after_invalid was ALWAYS != count_before
@@ -366,13 +379,25 @@ def main():
     parser.add_argument("--evidence-dir", default=None)
     parser.add_argument("--physical-confirmed", action="store_true",
                         help="Required for --mode physical: confirms scans were done with the real GM65/keypad.")
+    parser.add_argument("--emp-qr", default=EMP_QR,
+                        help="Employee scan value (default: LOCAL-TEST's NV002 fixture).")
+    parser.add_argument("--op-qr", default=OP_QR,
+                        help="Operation scan value (default: LOCAL-TEST's fixture -- pass the target "
+                             "environment's own started/IN_PROGRESS operation QR instead, e.g. "
+                             "PROD-TEST's OP-FASTTEST-01).")
+    parser.add_argument("--db-container", default=DB_CONTAINER,
+                        help="Docker container name for the DB assertions (default: LOCAL-TEST's).")
+    parser.add_argument("--db-name", default=DB_NAME,
+                        help="Database name inside --db-container (default: LOCAL-TEST's).")
+    parser.add_argument("--db-user", default=DB_USER)
     args = parser.parse_args()
 
     evidence_dir = args.evidence_dir or os.path.join(
         os.path.dirname(__file__), "..", "artifacts", "test-runs", time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
     evidence_dir = os.path.abspath(evidence_dir)
 
-    runner = KioskTestRunner(port=args.port, evidence_dir=evidence_dir)
+    runner = KioskTestRunner(port=args.port, evidence_dir=evidence_dir, emp_qr=args.emp_qr, op_qr=args.op_qr,
+                             db_container=args.db_container, db_name=args.db_name, db_user=args.db_user)
     try:
         if args.mode == "fast":
             ok = run_fast(runner, evidence_dir)
