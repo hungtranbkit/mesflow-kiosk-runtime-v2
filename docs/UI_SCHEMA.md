@@ -1,4 +1,4 @@
-# Backend-Controlled UI (Phase 4 design — not implemented yet)
+# Backend-Controlled UI (Phase 4 design)
 
 No browser, no React/Vue/HTML/CSS/JS runtime. Design:
 
@@ -6,10 +6,23 @@ No browser, no React/Vue/HTML/CSS/JS runtime. Design:
 backend authoring (JSON) -> compile -> compact UI bundle -> device -> native renderer
 ```
 
-**Status: schema/design only.** Nothing in this repository parses a bundle
-today — Phase 0's `renderer.cpp` draws a small fixed set of hardcoded
-screens directly. Everything below fixes the *target* contract so Phase 4
-implements against a stable design instead of improvising later.
+**Status (corrected 2026-08-25): PARTIALLY IMPLEMENTED, not schema-only.**
+This page's original framing ("nothing in this repository parses a bundle
+today") predates Phase 4 actually landing and is now stale — a real bundle
+parser/renderer (`src/protocol/ui_bundle.h/.cpp`,
+`Renderer::draw_from_bundle()`), server-side bundle storage
+(`kiosk_v2_ui_bundles`/`kiosk_v2_ui_desired`), and a bootstrap-time sync
+controller are all implemented and exercised on real hardware (see
+`docs/KIOSK_UI_GUIDE.md`). What's actually shipped is a real but
+DELIBERATELY NARROWER subset of the full aspirational schema below: only
+`TEXT`/`RECT`/`LINE` component types, `x`/`y`/`color`/`text`/`font_size`/
+`align` fields (`align:"center"` auto-shrinks on overflow), `font_size`
+2 (Body/16px) or 3 (Large/24px) for anything meant to match the current
+two-size hardcoded design. `container`/`button`/`progress`/`spinner`/
+`keypad`/`icon`/`divider` and the rest of the component whitelist below
+remain unimplemented target design, same as before. Treat every section
+below as the long-term target contract, not a description of what
+`ui_bundle.h`'s parser accepts today.
 
 ## Component whitelist
 

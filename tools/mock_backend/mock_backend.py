@@ -73,60 +73,50 @@ DROP_DELAY_S = 9  # past the device's RUNTIME_HTTP_HARD_DEADLINE_MS (8s)
 # firmware/kiosk_runtime_v2/src/protocol/ui_bundle.h's first real
 # implementation -- icon/value/status/progress/keypad from
 # docs/UI_SCHEMA.md's full aspirational list are reserved, not implemented).
-# Text components' `x` is currently DECORATIVE ONLY: the device's renderer
-# places every text row at a fixed left margin (x=4) and only reads `y` (to
-# pick which fixed 18px row to draw on) -- documented as a known
-# simplification in the Phase 4 report, not a bug.
-# Named font-size roles (Phase 4.1 §6 -- maintainability cleanup only, NOT
-# a schema/protocol change: these map directly to the SAME numeric
-# font_size the renderer's emit_component_text() already understands as an
-# Adafruit_GFX text-size multiplier. Raw ints remain fully valid/supported
-# for compatibility -- pass either. Sizes chosen from what's actually been
-# proven not to overflow real backend data on a 240px-wide screen this
-# session: FONT_VALUE stays small (1) for variable-length real names/
-# operation text specifically because a real one ("QA Local Test Operation
-# R-03" at size 2) was found clipping off-screen live.
-FONT_SMALL = 1      # brand/section labels, footer hints
-FONT_BODY = 1        # variable-length real data (names, operation text)
-FONT_VALUE = 2       # short, length-controlled emphasis (static titles)
-FONT_QUANTITY = 7    # QUANTITY_INPUT's giant digits -- the legacy-parity showcase
+# `x` is decorative only when `align` is unset (row-grid legacy bundles,
+# v1/v2 below); when a component sets "align":"center" the renderer computes
+# `x` itself via centered_x() and auto-shrinks font_size if the resolved
+# text would overflow (see draw_from_bundle() in renderer.cpp) -- v3 below
+# relies on that path exclusively.
+#
+# UI Consistency Cleanup (2026-08-25): the renderer's screen-level C++ code
+# was cut over to exactly TWO named font roles (kFontSmall=Body/16px,
+# kFontLarge=Large/24px -- see renderer.cpp's select_vn_font() comment).
+# Bundle wire format is unchanged/back-compat (any font_size 1-N still
+# decodes), but v3 -- the bundle meant to visually match that same design --
+# now only ever emits 2 (Body) or 3 (Large), never the old FONT_VALUE=2/
+# FONT_QUANTITY=7 legacy-parity roles that predate this cleanup.
+FONT_SMALL = 2   # == renderer.cpp's kFontSmall (Body/16px) -- most text
+FONT_LARGE = 3   # == renderer.cpp's kFontLarge (Large/24px) -- titles only
 
 
-def _text(y, text, color="#FFFFFF", size=FONT_SMALL):
+def _text(y, text, color="#FFFFFF", size=1):
     # §NVS/SPIFFS storage note: bundle JSON now lives on SPIFFS (1.5MB,
     # see firmware/kiosk_runtime_v2's default_8MB.csv), not the ~20KB nvs
     # partition -- the old ~2-2.3KB practical ceiling this comment used to
     # warn about no longer applies (Phase 4.1 §3 migration). `w`/`h` are
     # still omitted since the renderer computes them itself via
     # getTextBounds() at draw time (see emit_component_text()); `font_size`
-    # IS read now (true-geometry stabilization pass) -- default FONT_SMALL
-    # matches json_extract_*'s own default of 1 exactly, so omitting it
-    # entirely still behaves identically to passing FONT_SMALL explicitly.
+    # IS read now (true-geometry stabilization pass). Used only by the
+    # legacy row-grid v1/v2 bundles below -- v3 uses `_c()` instead.
     return {"type": "text", "x": 4, "y": y, "color": color, "text": text, "font_size": size}
 
 
-def _row(n, text, color="#FFFFFF"):
-    """Same as _text(), but addressed by the renderer's actual 0-9 row index
-    (row = y // 18 on the device) rather than a raw pixel y -- y=4+row*18
-    exactly reproduces Display::draw_line()'s own `4 + line_index*18`
-    formula, so this is just clearer bookkeeping, not a different value.
-    Rows 6/7 are reserved (transient_message / WiFi indicator respectively,
-    both spliced in by the renderer AFTER a bundle's own components) --
-    screens below deliberately never target them."""
-    return _text(4 + n * 18, text, color)
-
-
-def _hline(y, color="#1E293B"):
-    """Horizontal divider LINE component -- unlike TEXT, x/y/w ARE honored
-    pixel-exact by the renderer for LINE (see draw_from_bundle()), so `w`
-    must stay explicit here (its default is 0 -- an invisible line), unlike
-    _text()'s w/h/font_size which the renderer never reads for TEXT."""
-    return {"type": "line", "x": 4, "y": y, "w": 232, "color": color}
+def _c(y, text, color="#FFFFFF", size=FONT_SMALL, align="center"):
+    """Centered text component -- what v3 (the default/current-design
+    bundle) uses for every screen. `align` is read by draw_from_bundle():
+    the renderer computes `x` itself (centered_x()) and auto-shrinks
+    font_size if centered text would overflow, so `x` is omitted here on
+    purpose (would be dead/ignored input when align="center")."""
+    return {"type": "text", "x": 0, "y": y, "color": color, "text": text, "font_size": size, "align": align}
 
 
 # MESFlow v5 legacy (esp-kiosk) midnight-blue palette, read verbatim from its
 # own source (esp-kiosk/esp/mesflow_app.cpp's C_* constants' own hex
-# comments) -- the reference this bundle is matching for v1 visual parity.
+# comments). Kept as the current renderer's own accent/status palette too
+# (colors didn't change in the 2026-08-25 UI Consistency Cleanup, only
+# typography/layout did) -- the V1_ prefix is now a historical name, not a
+# claim that this bundle is still v1-parity (see UI_BUNDLE_CONTENT[3]).
 V1_WHITE = "#FFFFFF"    # C_TEXT
 V1_MUTED = "#94A3B8"    # C_MUTED
 V1_OK = "#22C55E"       # C_OK (status-positive green)
@@ -181,76 +171,55 @@ for _screen in UI_BUNDLE_CONTENT[2]["screens"]:
         _screen["components"].append(_text(58, "UI v2"))
 
 
-# Version 3: V1 VISUAL PARITY bundle -- content/hierarchy/colors read from
-# esp-kiosk (legacy v1, read-only reference)'s actual screen-drawing
-# functions (drawReady/drawWorker/drawStartSuccess/drawQtyInput/
-# drawMaintenanceScreen/drawError in esp-kiosk/esp/mesflow_app.cpp), adapted
-# to the CURRENT renderer's real constraints -- never redesigning those
-# constraints (see the Phase 4 V1 Visual Parity report for the full,
-# per-screen PASS/FAIL and every KNOWN DIFFERENCE this adaptation implies:
-# row-quantized Y instead of legacy's true pixel Y and bottom-anchored
-# footer, no icon/graphic component type yet, single font size, TEXT `x`
-# still decorative-only so no true two-column footer split).
+# Version 3: the DEFAULT/CURRENT-DESIGN bundle -- content, colors and
+# per-screen Y positions read verbatim from the renderer's OWN hardcoded
+# fallback (draw_business_state() in renderer.cpp), which is itself the
+# 2026-08-25 UI Consistency Cleanup's source of truth. This bundle exists so
+# a server-pushed UI can be exercised end-to-end (UI-003/UI-010's whole
+# point) while still looking IDENTICAL to what the device draws when no
+# bundle is active -- not a separate design, a mirror of one.
 #
-# Empirically found live (NOT a redesign, just a real capacity fact to
-# design within): staging a fresh bundle into the currently-inactive slot
-# failed with UI_UPDATE_STORAGE_FAILED at 2391 bytes but succeeded at 2066
-# and at a 217-byte control -- the 20KB shared `nvs` partition (see
-# default_8MB.csv) gives each bundle roughly a 2-2.3KB real budget once
-# every other config key and the other A/B slot are accounted for. Every
-# screen below is deliberately kept lean (no header/footer divider LINEs --
-# tested, cut for budget) to stay inside that ceiling with headroom.
+# Superseded the earlier "V1 VISUAL PARITY" bundle that used to live at this
+# version number (row-grid, left-aligned, single font size) -- that layout
+# predates the two-size/centered/fixed-zone design and no longer matches
+# what state_* screen_ids fall back to, so keeping it would have made a
+# real, observable regression (bundle active -> old row-grid look; bundle
+# absent -> new centered look) invisible to anyone testing only against
+# this mock. QUANTITY_INPUT/defect/rework are deliberately NOT covered here
+# (see note below the screens list) -- v2's giant-digit rendering
+# (kFontValueScale) has no bundle-schema equivalent, so those screen_ids
+# are left out of the manifest and the device transparently falls back to
+# its own hardcoded draw_quantity_input_screen()/etc. for them.
 UI_BUNDLE_CONTENT[3] = {
-    "manifest": {"version": 3, "schema_version": 1, "min_runtime_version": "0.4.0"},
+    "manifest": {"version": 3, "schema_version": 1, "min_runtime_version": "0.9.0"},
     "screens": [
-        # drawReady()
+        # draw_business_state() BusinessState::WAIT_EMPLOYEE / draw_title_2line()
         {"id": "state_wait_employee", "components": [
-            _row(0, "MESFlow Kiosk v2", V1_MUTED),
-            _row(2, "QUÉT THẺ NHÂN VIÊN", V1_WHITE),
-            _row(4, "Đưa mã vào máy quét", V1_MUTED),
+            _c(122, "SẴN SÀNG", V1_WHITE, FONT_LARGE),
+            _c(122 + 34, "QUÉT MÃ", V1_WHITE, FONT_LARGE),
         ]},
-        # drawWorker() -- "employee scanned, now scan operation"
+        # WAIT_OPERATION: employee name (accent) above a 2-line title
         {"id": "state_wait_operation", "components": [
-            _row(0, "{{employee_name}}", V1_OK),
-            _row(2, "QUÉT CÔNG ĐOẠN", V1_WHITE),
-            _row(9, "* HỦY", V1_MUTED),
+            _c(64, "{{employee_name}}", V1_OK, FONT_SMALL),
+            _c(142, "QUÉT MÃ", V1_WHITE, FONT_LARGE),
+            _c(142 + 34, "CÔNG ĐOẠN", V1_WHITE, FONT_LARGE),
         ]},
-        # drawStartSuccess() -- legacy's intermediate drawOperation()
-        # "scanned, confirm start" step has no equivalent v2 BusinessState
-        # (v2's state machine goes straight WAIT_OPERATION -> SESSION_ACTIVE
-        # server-side) -- documented as a KNOWN DIFFERENCE, not reproduced.
+        # SESSION_ACTIVE: title + employee/operation detail lines + footer hint
         {"id": "state_session_active", "components": [
-            _row(0, "{{employee_name}}", V1_OK),
-            _row(1, "{{operation_name}}", V1_WHITE),
-            _hline(38),
-            _row(2, "Mục tiêu: {{target_qty}}", V1_MUTED),
-            _row(3, "Đã làm: {{produced_qty}}", V1_MUTED),
-            _row(9, "* HỦY   # KẾT THÚC", V1_WHITE),
-        ]},
-        # drawQtyInput() -- legacy's FONT_QUANTITY=8 giant digits have no
-        # equivalent (TEXT component font_size is not yet honored by the
-        # renderer -- KNOWN DIFFERENCE, MAJOR: this is the single biggest
-        # visual gap of the whole parity pass).
-        {"id": "state_quantity_input", "components": [
-            _row(0, "{{operation_name}}", V1_OK),
-            _row(2, "Nhập số lượng đạt, # để gửi:", V1_WHITE),
-            _row(4, "{{local_digit_buffer}}", V1_WHITE),
-            _row(9, "* XÓA   # TIẾP", V1_WHITE),
+            _c(100, "ĐANG LÀM", V1_OK, FONT_LARGE),
+            _c(160, "{{employee_name}}", V1_WHITE, FONT_SMALL),
+            _c(186, "{{operation_name}}", V1_MUTED, FONT_SMALL),
+            _c(230, "Quét lại thẻ để kết thúc", V1_MUTED, FONT_SMALL),
         ]},
         # No direct legacy equivalent (esp-kiosk has no device-suspension
-        # concept) -- styled consistent with legacy's C_ERR-for-critical
-        # convention rather than invented from scratch.
+        # concept) -- styled consistent with the critical/warn palette
+        # rather than invented from scratch.
         {"id": "state_device_disabled", "components": [
-            _row(0, "THIẾT BỊ ĐÃ BỊ VÔ HIỆU HÓA", V1_ERR),
-            _row(2, "Liên hệ quản trị viên", V1_MUTED),
+            _c(130, "ĐÃ VÔ HIỆU HÓA", V1_ERR, FONT_LARGE),
+            _c(190, "Liên hệ quản trị viên", V1_WHITE, FONT_SMALL),
         ]},
-        # Simplified vs. legacy's drawMaintenanceScreen() (SSID/IP/pending-
-        # sync/last-sync panel): that data comes from the Phase 3 offline
-        # queue, which v2 doesn't have yet (out of scope this task) --
-        # KNOWN DIFFERENCE, documented, not a redesign of either system.
         {"id": "state_maintenance", "components": [
-            _row(0, "THIẾT BỊ ĐANG BẢO TRÌ", V1_WARN),
-            _row(2, "Liên hệ kỹ thuật", V1_MUTED),
+            _c(140, "ĐANG BẢO TRÌ", V1_WARN, FONT_LARGE),
         ]},
     ],
 }
@@ -268,7 +237,7 @@ def _bundle_hash(version):
 # separate from any individual device's own state (§22: UI version must
 # never track business state). Starts at the only version that exists;
 # /mock/admin/set-ui-version changes this for testing UI-003/UI-010.
-desired_ui_bundle_version = 3  # v1-parity bundle is now the default design target
+desired_ui_bundle_version = 3  # current-design (2-size/centered) bundle is the default
 
 
 def new_device_state():

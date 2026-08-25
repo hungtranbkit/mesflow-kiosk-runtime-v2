@@ -81,12 +81,16 @@ begin with (see "Not permanent" below). It is now **open, no password**:
   `/connecttest.txt` — more phones should pop the setup page automatically
   on join rather than needing the operator to know to open
   `192.168.4.1` themselves.
-- **On-screen text**: the portal-active screen now reads "WIFI SETUP /
-  Ket noi: MesflowKiosk-XXXX / Khong mat khau / Mo: 192.168.4.1" — explicit
+- **On-screen text**: the portal-active screen reads "CÀI ĐẶT WI-FI /
+  Kết nối: MesflowKiosk-XXXX / Không mật khẩu / Mở: 192.168.4.1" — explicit
   "no password" line so an operator isn't left hunting for one that doesn't
-  exist. Normal-operation screens are untouched (still the 4-character SSID
-  prefix near the Wi-Fi icon from the earlier session's work — this rework
-  does not restore "WiFi: OK" or otherwise touch that).
+  exist. (2026-08-25 UI Consistency Cleanup superseded the original ASCII
+  "WIFI SETUP / Ket noi: ... / Khong mat khau" copy this bullet used to
+  quote with full-diacritic Vietnamese, via `draw_wifi_portal_active()` —
+  same information, proper glyphs.) Normal-operation screens still carry
+  the 4-character SSID prefix + graphical signal-bar icon top-right (now
+  via the shared `draw_status_bar()` helper, same behavior as before this
+  rework touched it).
 
 ### Security note (§12 of the task) — why an open AP is an accepted trade-off, not an oversight
 

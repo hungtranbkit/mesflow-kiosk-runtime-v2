@@ -238,6 +238,36 @@ class Renderer {
   // to go dig for.
   void draw_wifi_indicator(WifiIndicator wifi);
 
+  // --- Design-system helpers (2026-08-25 UI consistency cleanup, see
+  // docs/KIOSK_UI_GUIDE.md) -- every draw_*screen() method above is built
+  // ONLY from these plus begin_screen()/end_screen(). No numeric font size
+  // or layout coordinate is picked at the call site of any of those.
+
+  // Fixed header zone: WiFi signal bars + 4-char SSID prefix, same position
+  // on every screen. draw_wifi_indicator() above now just delegates here.
+  void draw_status_bar(WifiIndicator wifi);
+  // One FONT_LARGE line, centered -- for a KNOWN short literal already
+  // chosen to fit (not variable operator/server data -- see draw_fit_text).
+  void draw_title_line(const String& text, int16_t y, uint16_t color);
+  // Two fixed FONT_LARGE lines, centered as a block (the "QUÉT THẺ /
+  // NHÂN VIÊN"-style primary instruction most workflow screens use).
+  void draw_title_2line(const String& line1, const String& line2, int16_t y_top, uint16_t color);
+  // Shared fit policy for variable-length content (employee/operation
+  // names, server/error messages): LARGE-1-line -> SMALL-1-line ->
+  // SMALL-2-line-wrap -> SMALL-2-line-wrap-with-ellipsis. Never a third
+  // font size, never a silent clip. prefer_large=false skips straight to
+  // the SMALL-first path (used for anything that was never meant to be the
+  // screen's single dominant instruction, e.g. a raw scanned code).
+  void draw_fit_text(const String& text, int16_t y_top, uint16_t color, bool prefer_large);
+  // The one emphasized-size helper, for the giant quantity-VALUE digit only
+  // -- still conceptually FONT_LARGE (see kFontValueScale's own comment in
+  // renderer.cpp), just drawn with extra visual weight. No other call site
+  // uses this.
+  void draw_value_giant(const String& text, int16_t y, uint16_t color);
+  // Consistent bottom action/hint row: SMALL only, fixed position, same
+  // divider line on every screen that has one. Pass "" to skip a side.
+  void draw_footer(const String& left, const String& right);
+
   // Starts a new logical screen: resets the tracked line/component state
   // and records its id for /debug/ui-state. Every draw_*screen method calls
   // this first.
