@@ -28,6 +28,12 @@ class WifiManager {
 
   WifiState state() const { return state_; }
 
+  // Counts CONNECTED transitions after the first (i.e. reconnects, not the
+  // initial connect) -- added 2026-08-25 for the net-diag connectivity
+  // investigation, so a high count is visible as a hard number instead of
+  // inferred from log scrollback.
+  uint32_t reconnect_count() const { return reconnect_count_; }
+
   // §4/§5 of the 2026-08-25 recovery-menu follow-up: "RETRY NETWORK" from
   // the local recovery menu. A no-op unless currently DISCONNECTED and
   // waiting out the retry cooldown -- CONNECTING/CONNECTED already have
@@ -41,6 +47,8 @@ class WifiManager {
   String password_;
   unsigned long connect_started_ms_ = 0;
   unsigned long next_retry_ms_ = 0;
+  uint32_t reconnect_count_ = 0;
+  bool ever_connected_ = false;
 
   void set_state(WifiState new_state);
 };

@@ -114,6 +114,11 @@ void WifiManager::set_state(WifiState new_state) {
     // MESFLOW_DEBUG_API (docs/VISUAL_DEBUG.md) -- log it directly here.
     kiosk::health::log_structured("INFO", "NET_WIFI_IP", "wifi_manager",
                                    WiFi.localIP().toString().c_str());
+    if (ever_connected_) {
+      ++reconnect_count_;
+    } else {
+      ever_connected_ = true;
+    }
   }
 
   kiosk::runtime::LocalEvent event;

@@ -25,6 +25,7 @@
 #include "src/hardware/scanner_gm65.h"
 #include "src/network/bootstrap_client.h"
 #include "src/network/heartbeat_client.h"
+#include "src/network/net_diag.h"
 #include "src/network/time_sync.h"
 #include "src/network/wifi_manager.h"
 #include "src/network/wifi_setup_portal.h"
@@ -347,6 +348,11 @@ namespace {
 //                             "##MFDBG-BEGIN ui-state##" / "##MFDBG-END##"
 //                             marker pair.
 //   debug-device-state          same idea for GET /debug/device-state's JSON.
+//   debug-net-diag               2026-08-25 connectivity investigation:
+//                             layer-by-layer WiFi/gateway/DNS/TCP/HTTP probe
+//                             against dev.mesflow.net + prod.mesflow.net,
+//                             plain WiFiClient only (no TLS) -- see
+//                             src/network/net_diag.h's own header comment.
 //   debug-input:<json>          same SCAN/KEY_DOWN/KEY_UP dispatch as
 //                             POST /debug/input, e.g.
 //                             debug-input:{"type":"SCAN","value":"00152"} --
@@ -618,6 +624,8 @@ void poll_serial_provisioning() {
         g_debug_server.write_ui_state_serial(Serial);
       } else if (line == "debug-device-state") {
         g_debug_server.write_device_state_serial(Serial);
+      } else if (line == "debug-net-diag") {
+        kiosk::network::run_net_diag(Serial, g_wifi.reconnect_count());
       } else if (line.startsWith("debug-input:")) {
         // Same SCAN/KEY_DOWN/KEY_UP JSON body as POST /debug/input, e.g.
         // debug-input:{"type":"SCAN","value":"00152"} -- needed to drive
