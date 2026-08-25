@@ -199,14 +199,30 @@ verified live on real hardware this phase:
 
 ## Known limitations (do not assume otherwise)
 
-- **No durable offline journal.** An event is genuinely lost if it can't
-  be sent (no queue, no retry beyond the current attempt's max) — the
-  runtime says so on-screen. Phase 3.
+- ~~No durable offline journal~~ -- fixed 2026-08-24, see "Anti-Stuck
+  Runtime Policy" below: a real crash-safe event journal
+  (PENDING/INFLIGHT/ACKED/REJECTED, incremental compaction, verified
+  against all 4 crash-mid-compaction windows on real hardware) exists now.
+  This line predated that work and was never updated. Remaining real gap:
+  the journal isn't cleared/isolated when `api-endpoint:` changes to a
+  different backend -- old PENDING events from a prior backend get
+  replayed against whatever's configured now (harmless -- they just get
+  rejected -- but noisy; see the bug backlog).
 - **mTLS/secure boot/flash encryption**: designed only, zero code. Plain
   HTTP. See `docs/SECURITY.md`.
-- **No authoritative backend state.** Placeholder `READY_LOCAL` runtime
-  state. Phase 2.
-- **No backend-controlled UI.** Screens are hardcoded. Phase 4.
+- ~~No authoritative backend state~~ -- fixed. `READY_LOCAL` is still real
+  but is only the transient state between boot and the first successful
+  bootstrap; every business screen (`WAIT_EMPLOYEE`/`WAIT_OPERATION`/
+  `SESSION_ACTIVE`/`QUANTITY_INPUT`) is server-driven now (`state.source:
+  "SERVER"`), verified extensively on real hardware this session. This
+  line predated that work.
+- ~~No backend-controlled UI~~ -- partially fixed: the backend-managed UI
+  bundle system (`kiosk_v2_ui_bundles`/`kiosk_v2_ui_desired`, download-on-
+  change, A/B slot swap) is real and working (verified live: pushed a
+  fixed bundle, watched the device detect the hash mismatch and re-sync).
+  What's still hardcoded: the quantity-entry flow's screens
+  (`draw_quantity_defect_screen()` etc. in `renderer.cpp`) -- only the
+  simpler business-state screens go through the bundle system so far.
 - ~~No Vietnamese glyph support at all~~ -- fixed 2026-08-25, see
   `docs/VIETNAMESE_FONT.md`: three native-size bitmap fonts (12/16/24px,
   porting v1's proven strategy), full precomposed Vietnamese coverage,
