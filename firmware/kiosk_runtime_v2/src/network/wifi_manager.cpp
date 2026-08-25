@@ -3,6 +3,7 @@
 #include <WiFi.h>
 
 #include "../config/runtime_config.h"
+#include "../health/memory_diag.h"
 #include "../health/structured_log.h"
 
 namespace kiosk::network {
@@ -31,7 +32,30 @@ void WifiManager::begin(const String& ssid, const String& password) {
     return;
   }
 
+#if MESFLOW_DEBUG_API
+  kiosk::health::log_memory_snapshot("BEFORE_WIFI_MODE_STA");
+#endif
   WiFi.mode(WIFI_STA);
+#if MESFLOW_DEBUG_API
+  kiosk::health::log_memory_snapshot("AFTER_WIFI_MODE_STA");
+#endif
+  // Root-cause fix (2026-08-24): disable WiFi modem-sleep power save.
+  // Diagnosed live against the real "3..." AP -- both the event-sender
+  // (persistent WiFiClientSecure) AND heartbeat_client (fresh WiFiClientSecure
+  // via http.begin(url)) failed NET_CONNECT_REFUSED in the SAME ~30s burst
+  // window despite excellent RSSI (-39) and wifi_connected staying true the
+  // whole time -- ruling out DNS, signal quality, and the persistent-client
+  // architecture as the cause (two independent, differently-coded call sites
+  // failed together). That pattern -- L2 association fine, NEW TCP/TLS
+  // connection attempts stalling/failing in bursts -- is the well-documented
+  // ESP32 default modem-sleep (WIFI_PS_MIN_MODEM) behavior: the radio dozes
+  // between DTIM beacons and can miss/delay the handshake window for a new
+  // connection, especially with some APs' beacon/DTIM timing (host laptop
+  // and phone are unaffected because neither uses this power-save mode).
+  // setSleep(false) keeps the radio fully awake; costs some power draw, which
+  // is acceptable for a mains-powered kiosk. Must be called after mode(STA),
+  // before/at begin() -- matches Espressif's own documented guidance.
+  WiFi.setSleep(false);
   WiFi.begin(ssid_.c_str(), password_.c_str());
   connect_started_ms_ = millis();
   set_state(WifiState::CONNECTING);
@@ -71,6 +95,13 @@ void WifiManager::poll() {
     connect_started_ms_ = millis();
     set_state(WifiState::CONNECTING);
   }
+}
+
+void WifiManager::retry_now() {
+  if (state_ != WifiState::DISCONNECTED) return;  // already trying or already connected -- nothing to force
+  kiosk::health::log_structured("INFO", "NET_WIFI_RETRY_NOW", "wifi_manager",
+                                "operator-requested retry from recovery menu");
+  next_retry_ms_ = millis();  // poll()'s own DISCONNECTED branch fires on the very next call
 }
 
 void WifiManager::set_state(WifiState new_state) {

@@ -66,6 +66,20 @@ class KeypadPcf8574 {
   int stable_emitted_pair_ = -1;  // -1 = nothing currently held down
   unsigned long last_poll_ms_ = 0;
 
+  // §7 of the 2026-08-25 finish-anti-stuck-recovery follow-up: scan_pair()
+  // already returns a real, concrete I2C-communication-error signal (-3) --
+  // unlike the scanner (plain UART silence, which is ALSO the normal idle
+  // state, so there's no reliable failure signal to key an auto-reinit off
+  // of -- see scanner_gm65.h's own comment on why it does NOT get one).
+  // 50 consecutive errors (~600ms at kPollIntervalMs=12ms) is deliberately
+  // not hair-triggered on one or two transient bus glitches, but still
+  // fast enough that an operator waiting on the keypad doesn't notice a
+  // multi-second gap. Not "aggressive periodic resets" (task's own
+  // wording) -- this only fires on SUSTAINED communication failure.
+  static constexpr int kI2cErrorReinitThreshold = 50;
+  int consecutive_i2c_errors_ = 0;
+  void reinit_bus();
+
   bool i2c_write_read(uint8_t drive_value, uint8_t& sensed_value);
   void release_all();
   // Returns encoded pair (pinA<<4)|pinB for exactly one shorted pair, -1 for

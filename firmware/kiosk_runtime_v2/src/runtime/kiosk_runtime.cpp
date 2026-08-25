@@ -1,10 +1,17 @@
 #include "kiosk_runtime.h"
 
+#include <esp_heap_caps.h>
+
 #include <cstdlib>
 
+#include "../health/memory_diag.h"
+#include "../health/recovery_supervisor.h"
 #include "../health/structured_log.h"
 #include "../network/endpoint_utils.h"
+#include "../protocol/crc32.h"
+#include "../protocol/journal_record.h"
 #include "../protocol/protocol_codec.h"
+#include "recovery_overlay.h"
 
 namespace kiosk::runtime {
 
@@ -53,6 +60,9 @@ void KioskRuntime::begin(const String& boot_id) {
 
 void KioskRuntime::refresh_idle_screen() {
   render_current_business_state();
+#if MESFLOW_DEBUG_API
+  kiosk::health::log_memory_snapshot("AFTER_RENDER");
+#endif
 }
 
 void KioskRuntime::on_bootstrap_result(const kiosk::network::BootstrapResult& result) {
@@ -86,6 +96,28 @@ void KioskRuntime::on_bootstrap_result(const kiosk::network::BootstrapResult& re
 // 6 canonical business states -- StateProjection never holds it.
 void KioskRuntime::render_current_business_state(const String& transient_message, bool is_error,
                                                   bool is_network_error) {
+  // §6/§15: default to "not showing the error view" -- the one branch below
+  // that actually draws it re-sets this true right before returning. Every
+  // OTHER branch in this function (identity/resyncing/waiting/bundle/quantity
+  // sub-steps/normal business state) IS itself a real screen transition, so
+  // it correctly counts as "the next render call" that dismisses the error
+  // view per its own documented design, whether or not it happens to also be
+  // carrying its own transient_message. Captured BEFORE the reset below so
+  // repeated consecutive error redraws (e.g. two busy-retries in a row)
+  // keep counting the timeout from the ORIGINAL onset, not restart it.
+  bool was_already_showing_error = showing_error_view_;
+  showing_error_view_ = false;
+
+  // §2/§3 of the 2026-08-25 finish-anti-stuck-recovery follow-up: SAFE_MODE
+  // takes over the ENTIRE screen, same as the identity/waiting screens
+  // below but checked first -- no business flow renders at all while this
+  // is true (handle_scan()/handle_business_key() independently refuse to
+  // act, so there is nothing for those screens to show anyway).
+  if (kiosk::health::is_safe_mode()) {
+    renderer_.draw_safe_mode_screen(kiosk::health::safe_mode_reason(), wifi_indicator_);
+    return;
+  }
+
   ProvisioningState state = identity_.state();
   if (state != ProvisioningState::ACTIVE) {
     renderer_.draw_identity_screen(state, hardware_id_, wifi_indicator_);
@@ -114,6 +146,11 @@ void KioskRuntime::render_current_business_state(const String& transient_message
   // mechanism transient_message already used, no new timing/state machine
   // invented.
   if (is_error && transient_message.length() > 0) {
+    // §6/§15: remember that we're showing this so poll()'s
+    // check_error_view_timeout() can force a way out if nothing else ever
+    // triggers a subsequent render (the exact real incident this fixes).
+    if (!was_already_showing_error) error_view_shown_at_ms_ = millis();
+    showing_error_view_ = true;
     renderer_.draw_error_view(transient_message, is_network_error, wifi_indicator_);
     return;
   }
@@ -175,6 +212,17 @@ String KioskRuntime::state_endpoint_url() const {
   String base = kiosk::network::derive_sibling_endpoint(api_endpoint_, "state");
   if (base.length() == 0) return "";
   return base + "?device_id=" + device_id_;
+}
+
+void KioskRuntime::request_manual_resync() {
+  if (identity_.state() != ProvisioningState::ACTIVE) {
+    kiosk::health::log_structured("INFO", "RECOVERY_MENU_RESYNC_SKIPPED", "kiosk_runtime",
+                                  "identity not ACTIVE -- nothing to resync against");
+    return;
+  }
+  kiosk::health::log_structured("INFO", "RECOVERY_MENU_RESYNC", "kiosk_runtime",
+                                "operator-requested resync from recovery menu");
+  start_resync();
 }
 
 void KioskRuntime::start_resync() {
@@ -241,7 +289,13 @@ void KioskRuntime::handle_local_event(const LocalEvent& event) {
       // working independent of whatever business/session logic lives here,
       // and independent of provisioning state (§40).
       last_key_ = event.key;
-      if (event.key != '*') {
+      // §5 of the 2026-08-25 follow-up: while the recovery menu or the
+      // Wi-Fi setup portal owns the screen, a digit key is meant for THAT
+      // overlay (WifiRecoveryController handles it directly, same bus
+      // event), never for whatever business input happens to be underneath
+      // -- must never silently mutate business state (e.g. QUANTITY_INPUT's
+      // local digit buffer) from a keypress the operator aimed at the menu.
+      if (event.key != '*' && !kiosk::runtime::recovery_overlay_active()) {
         char msg[32];
         snprintf(msg, sizeof(msg), "key=%c %s", event.key,
                  event.kind == LocalEventKind::KEY_DOWN ? "down" : "up");
@@ -279,6 +333,16 @@ void KioskRuntime::handle_local_event(const LocalEvent& event) {
 }
 
 void KioskRuntime::handle_scan(const String& raw_code, unsigned long timestamp_ms) {
+  // §2/§3 of the 2026-08-25 finish-anti-stuck-recovery follow-up: SAFE_MODE
+  // runs no business flow at all -- no network call, no journal write, just
+  // an honest log line. The SAFE_MODE screen (drawn by
+  // render_current_business_state()'s own top-of-function gate) is the only
+  // thing on screen; recovery happens via the '*'-hold menu, not scans.
+  if (kiosk::health::is_safe_mode()) {
+    kiosk::health::log_structured("INFO", "SAFE_MODE_SCAN_IGNORED", "kiosk_runtime",
+                                  "scan ignored -- device is in SAFE_MODE");
+    return;
+  }
   last_scan_ = raw_code;
 
   // Immediate LOCAL presentation feedback — before any network attempt.
@@ -293,7 +357,7 @@ void KioskRuntime::handle_scan(const String& raw_code, unsigned long timestamp_m
     const char* code = identity_error_code(state);
     kiosk::health::log_structured("WARN", code, "kiosk_runtime",
                                    "scan rejected: device not ACTIVE, no backend contacted");
-    renderer_.draw_scan_result(raw_code, "Thiet bi chua san sang (xem man hinh chinh)", code,
+    renderer_.draw_scan_result(raw_code, "Thiết bị chưa sẵn sàng (xem màn hình chính)", code,
                                wifi_indicator_);
     return;
   }
@@ -301,6 +365,9 @@ void KioskRuntime::handle_scan(const String& raw_code, unsigned long timestamp_m
   kiosk::protocol::OptionalQuantity none;  // SCAN never carries quantity_good
   send_business_event(kiosk::protocol::EventType::SCAN, raw_code, none);
   (void)timestamp_ms;  // superseded by send_business_event's own millis() read
+#if MESFLOW_DEBUG_API
+  kiosk::health::log_memory_snapshot("AFTER_SCAN_EVENT");
+#endif
 }
 
 // §14: this NEVER decides a business transition -- it only decides which
@@ -326,6 +393,7 @@ void KioskRuntime::submit_final_quantity(int32_t good, int32_t defect, int32_t r
 }
 
 void KioskRuntime::handle_business_key(char key) {
+  if (kiosk::health::is_safe_mode()) return;  // SAFE_MODE: no business flow -- see handle_scan()'s own comment
   if (identity_.state() != ProvisioningState::ACTIVE) return;
   if (!state_projection_.has_snapshot() || resyncing_) return;  // no server authority to act against yet
 
@@ -381,7 +449,7 @@ void KioskRuntime::handle_business_key(char key) {
           // §: "If DEFECT == 0: finish immediately" -- no repairable
           // question, rework is meaninglessly 0. Deliberately NOT clearing
           // local_qty_buffer_ here (real bug found live, 2026-08-24): the
-          // "Dang gui..." immediate-feedback frame send_business_event()
+          // "Đang gửi..." immediate-feedback frame send_business_event()
           // draws right after this call re-renders whatever qty_step_/
           // buffer state currently is -- clearing first made it flash an
           // empty/zero digit screen instead of the value just entered.
@@ -403,7 +471,7 @@ void KioskRuntime::handle_business_key(char key) {
         // defense in depth, not trusting the device alone.
         if (value > qty_defect_) {
           local_qty_buffer_.clear();
-          render_current_business_state("SO LUONG SUA KHONG DUOC LON HON SO LUONG LOI", true, false);
+          render_current_business_state("SỐ LƯỢNG SỬA KHÔNG ĐƯỢC LỚN HƠN SỐ LƯỢNG LỖI", true, false);
           return;
         }
         // Same "don't clear before the submit-triggered re-render" fix as
@@ -434,17 +502,24 @@ void KioskRuntime::send_business_event(kiosk::protocol::EventType type, const St
   if (api_endpoint_.length() == 0) {
     kiosk::health::log_structured("WARN", "CONFIG_BACKEND_NOT_SET", "kiosk_runtime",
                                    "event rejected: no backend configured");
-    render_current_business_state("Chua cau hinh may chu (api-endpoint)", true, true);
+    render_current_business_state("Chưa cấu hình máy chủ (api-endpoint)", true, true);
     return;
   }
 
-  if (sender_.busy()) {
+  // send_retry_pending_ counts as "busy" too (2026-08-24 self-recovery task)
+  // -- sender_.busy() alone is false while a task-creation-failure retry is
+  // scheduled (xTaskCreate never actually started, so busy_ never flipped
+  // true), which would otherwise let a NEW scan/keypress race in during the
+  // ~kSendRetryDelayMs window, steal the sender, and make check_send_retry()
+  // misread the sender's real busy-with-something-else state as "the retry
+  // itself failed again" and wrongly escalate to a reboot.
+  if (sender_.busy() || send_retry_pending_) {
     // §14 of the original spec / Phase 3: no durable journal exists yet, so
     // there is nowhere honest to queue this -- say so plainly rather than
     // silently dropping it or pretending it was queued.
     kiosk::health::log_structured("WARN", "EVENT_DROPPED_BUSY", "kiosk_runtime",
-                                   "previous event still sending; no journal yet to queue this one");
-    render_current_business_state("Dang gui su kien truoc - CHUA duoc luu", true, true);
+                                   "previous event still sending/retrying; no journal yet to queue this one");
+    render_current_business_state("Đang gửi sự kiện trước - CHƯA được lưu", true, true);
     return;
   }
 
@@ -475,6 +550,38 @@ void KioskRuntime::send_business_event(kiosk::protocol::EventType type, const St
 
   std::string json_body = kiosk::protocol::encode_event_json(event);
 
+  // Phase 3A SHADOW MODE (§16 of the durable-journal task): journal a
+  // PENDING copy of this event's lifecycle for durability-proving purposes
+  // ONLY -- this does NOT send anything itself, does NOT gate/delay the
+  // real send below, and its result is never consulted by any business
+  // decision. Same event_id/device_seq/payload as what's about to actually
+  // be sent, so the shadow record can be verified against the real outcome.
+  // Only "critical operator action" events are durable per docs/OFFLINE.md
+  // ("heartbeat/spinner/telemetry" stay non-durable) -- SCAN/
+  // FINISH_REQUESTED/QUANTITY_SUBMITTED are exactly the events reaching
+  // this function, so no extra filtering is needed here.
+  {
+    kiosk::protocol::JournalRecord jr;
+    jr.record_version = 1;
+    jr.event_id = event.event.event_id;
+    jr.device_seq = event.event.device_seq;
+    jr.boot_id = boot_id_.c_str();
+    jr.event_type = kiosk::protocol::event_type_to_string(type);
+    jr.payload = json_body;
+    char hash_hex[9];
+    snprintf(hash_hex, sizeof(hash_hex), "%08x",
+             kiosk::protocol::crc32(reinterpret_cast<const uint8_t*>(json_body.data()), json_body.size()));
+    jr.payload_hash = hash_hex;
+    jr.expected_state_version = event.context.expected_state_version;
+    jr.created_uptime_ms = event.time.uptime_ms;
+    jr.time_sync_status = kiosk::protocol::time_sync_status_to_string(event.time.sync_status);
+    jr.sync_status = kiosk::protocol::JournalSyncStatus::PENDING;
+    journal_.append_event(jr);  // failure (FULL/DUPLICATE) is logged internally; shadow mode never blocks on it
+#if MESFLOW_DEBUG_API
+    kiosk::health::log_memory_snapshot("AFTER_JOURNAL_APPEND");
+#endif
+  }
+
   kiosk::health::log_structured(
       "INFO", "EVENT_CREATED", "kiosk_runtime",
       (std::string("event_id=") + event.event.event_id +
@@ -493,20 +600,107 @@ void KioskRuntime::send_business_event(kiosk::protocol::EventType type, const St
   // for keypad-triggered events, show a lightweight "sending" note on top
   // of the current (still-authoritative-until-proven-otherwise) screen.
   if (type != kiosk::protocol::EventType::SCAN) {
-    render_current_business_state("Dang gui...", false);
+    render_current_business_state("Đang gửi...", false);
   }
 
   bool started = sender_.send(api_endpoint_, json_body.c_str(), event.event.event_id,
                               event.event.device_seq);
-  if (!started) {
-    // send() only refuses if already busy, which we already checked above
-    // -- a race between the check and here is possible in principle but
-    // harmless: report it honestly rather than assume success.
-    scan_pending_result_ = false;
+  if (started) {
+    // Shadow-mode lifecycle: PENDING -> IN_FLIGHT now that the real async
+    // send has actually started (§18 of the task).
+    kiosk::protocol::JournalTransition jt;
+    jt.event_id = event.event.event_id;
+    jt.sync_status = kiosk::protocol::JournalSyncStatus::IN_FLIGHT;
+    jt.retry_count = 0;
+    jt.last_attempt_uptime_ms = millis();
+    journal_.append_transition(jt);
+  } else {
+    // send() only refuses if already busy (checked above -- a race between
+    // that check and here is possible in principle but harmless) or if
+    // xTaskCreate() itself failed (API_ERR_TASK_CREATE_FAILED) -- the real,
+    // reproduced root cause behind this task ("stuck on error screen" after
+    // journal-driven RAM exhaustion). §10: retry ONCE after a bounded delay
+    // rather than leaving this as an immediate, uninvestigated dead end --
+    // the event is already durably PENDING in the journal above regardless
+    // of which path this takes, so nothing is lost either way.
     kiosk::health::log_structured("ERROR", "EVENT_SEND_START_FAILED", "kiosk_runtime",
                                    event.event.event_id.c_str());
-    render_current_business_state("Loi gui su kien - CHUA duoc luu", true, true);
+    if (!send_retry_pending_) {
+      send_retry_pending_ = true;
+      send_retry_at_ms_ = millis() + kSendRetryDelayMs;
+      retry_json_body_ = json_body;
+      retry_event_id_ = event.event.event_id;
+      retry_device_seq_ = event.event.device_seq;
+      // Opportunistic: if the journal itself is under pressure, a
+      // compaction right now is the single most likely fix for exactly
+      // this failure mode -- don't wait for the periodic 30s check.
+      if (journal_.should_consider_compaction()) journal_.compact();
+      render_current_business_state("Lỗi gửi sự kiện - đang thử lại...", true, true);
+    } else {
+      // A retry was ALREADY pending when this happened again -- i.e. two
+      // consecutive task-creation failures. Treat this as
+      // application-level-exhausted for this boot: leaving the operator
+      // parked on a screen that will never recover on its own is exactly
+      // the "no dead-end" invariant this task exists to enforce, so
+      // escalate to a controlled reboot instead.
+      scan_pending_result_ = false;
+      uint32_t mem_free = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+      uint32_t mem_largest = static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+      kiosk::health::request_controlled_reboot(
+          kiosk::health::RecoveryCode::TASK_CREATE_FAILED,
+          ("second consecutive xTaskCreate failure, event_id=" + event.event.event_id).c_str(),
+          static_cast<uint8_t>(journal_.pressure()), mem_free, mem_largest);
+      // request_controlled_reboot() never returns.
+    }
   }
+}
+
+void KioskRuntime::check_send_retry() {
+  if (!send_retry_pending_) return;
+  if (millis() < send_retry_at_ms_) return;
+
+  bool started = sender_.send(api_endpoint_, retry_json_body_.c_str(), retry_event_id_, retry_device_seq_);
+  if (started) {
+    send_retry_pending_ = false;
+    kiosk::protocol::JournalTransition jt;
+    jt.event_id = retry_event_id_;
+    jt.sync_status = kiosk::protocol::JournalSyncStatus::IN_FLIGHT;
+    jt.retry_count = 1;
+    jt.last_attempt_uptime_ms = millis();
+    journal_.append_transition(jt);
+    kiosk::health::log_structured("INFO", "EVENT_SEND_RETRY_OK", "kiosk_runtime", retry_event_id_.c_str());
+  } else {
+    // Second consecutive failure for the SAME event -- send_business_event()
+    // won't be called again for it, so drive the same escalation from here.
+    send_retry_pending_ = false;
+    scan_pending_result_ = false;
+    uint32_t mem_free = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    uint32_t mem_largest = static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    kiosk::health::request_controlled_reboot(
+        kiosk::health::RecoveryCode::TASK_CREATE_FAILED,
+        ("retry itself failed to spawn a task, event_id=" + retry_event_id_).c_str(),
+        static_cast<uint8_t>(journal_.pressure()), mem_free, mem_largest);
+    // never returns.
+  }
+}
+
+void KioskRuntime::check_error_view_timeout() {
+  if (!showing_error_view_) return;
+  if (millis() - error_view_shown_at_ms_ < kErrorViewTimeoutMs) return;
+
+  // §6/§15: nothing else has triggered a redrawing render call within the
+  // timeout -- force one now rather than leave the operator stuck. This is
+  // a PRESENTATION-only recovery: it does not touch state_projection_,
+  // does not resend/cancel anything in flight, and does not fabricate a
+  // business outcome -- it only returns to whatever the current
+  // authoritative state actually is (or the identity/waiting screen, same
+  // as any other refresh).
+  uint32_t mem_free = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+  uint32_t mem_largest = static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  kiosk::health::record_recovery_event(kiosk::health::RecoveryCode::UI_STALL,
+                                       "error view auto-timeout -- returning to current authoritative state",
+                                       static_cast<uint8_t>(journal_.pressure()), mem_free, mem_largest);
+  refresh_idle_screen();
 }
 
 void KioskRuntime::poll() {
@@ -522,7 +716,7 @@ void KioskRuntime::poll() {
 
     // §66/§27: structured evidence tying this result back to the specific
     // event_id/device_seq it belongs to.
-    char msg[160];
+    char msg[192];
     snprintf(msg, sizeof(msg),
              "event_id=%s device_seq=%llu http_status=%d latency_ms=%u retry_count=%d error_code=%s",
              result.event_id.c_str(), static_cast<unsigned long long>(result.device_seq),
@@ -538,9 +732,23 @@ void KioskRuntime::poll() {
       // accept/reject/conflict, is HTTP 200) -- the authoritative state is
       // simply unknown to have changed; stay on the current screen and
       // surface an honest transient error.
+      //
+      // Shadow-mode journal: docs/OFFLINE.md's "TIMEOUT DOES NOT MEAN
+      // SERVER DID NOT PROCESS" -- a transport failure is NEVER recorded as
+      // REJECTED/CONFLICT here (that would be a guess), only as still-
+      // PENDING with the attempt/error recorded. Phase 3B's replay logic is
+      // exactly what will later act on this; Phase 3A only observes it.
+      kiosk::protocol::JournalTransition jt;
+      jt.event_id = result.event_id;
+      jt.sync_status = kiosk::protocol::JournalSyncStatus::PENDING;
+      jt.retry_count = static_cast<uint32_t>(last_retry_count_);
+      jt.last_attempt_uptime_ms = millis();
+      jt.last_error_code = result.outcome.error_code;
+      journal_.append_transition(jt);
+
       String msg_line = result.outcome.error_code == "NET_WIFI_DOWN"
-                            ? String("Khong co Wi-Fi - CHUA duoc luu")
-                            : String("Loi ket noi may chu - CHUA duoc luu");
+                            ? String("Không có Wi-Fi - CHƯA được lưu")
+                            : String("Lỗi kết nối máy chủ - CHƯA được lưu");
       render_current_business_state(msg_line, true, true);
     } else {
       kiosk::protocol::EventResponse resp;
@@ -553,6 +761,9 @@ void KioskRuntime::poll() {
   if (state_fetcher_.poll(fetch_result)) {
     handle_resync_result(fetch_result);
   }
+
+  check_send_retry();
+  check_error_view_timeout();
 }
 
 void KioskRuntime::apply_event_response(bool parsed, const kiosk::protocol::EventResponse& resp,
@@ -562,7 +773,17 @@ void KioskRuntime::apply_event_response(bool parsed, const kiosk::protocol::Even
 
   if (!parsed || resp.kind == EventOutcomeKind::MALFORMED) {
     kiosk::health::log_structured("ERROR", "EVENT_RESPONSE_MALFORMED", "kiosk_runtime", event_id.c_str());
-    render_current_business_state("Phan hoi khong hop le tu server", true, true);
+    // Same "don't guess" reasoning as the transport-failure case above --
+    // a malformed response body is not evidence of accept or reject.
+    {
+      kiosk::protocol::JournalTransition jt;
+      jt.event_id = event_id;
+      jt.sync_status = kiosk::protocol::JournalSyncStatus::PENDING;
+      jt.last_error_code = "EVENT_RESPONSE_MALFORMED";
+      jt.last_attempt_uptime_ms = millis();
+      journal_.append_transition(jt);
+    }
+    render_current_business_state("Phản hồi không hợp lệ từ server", true, true);
     return;
   }
 
@@ -574,6 +795,14 @@ void KioskRuntime::apply_event_response(bool parsed, const kiosk::protocol::Even
         (std::string("event_id=") + event_id +
          " current_state_version=" + std::to_string(resp.current_state_version))
             .c_str());
+    {
+      kiosk::protocol::JournalTransition jt;
+      jt.event_id = event_id;
+      jt.sync_status = kiosk::protocol::JournalSyncStatus::CONFLICT;
+      jt.last_error_code = "STATE_CONFLICT";
+      jt.last_attempt_uptime_ms = millis();
+      journal_.append_transition(jt);
+    }
     start_resync();
     return;
   }
@@ -603,6 +832,19 @@ void KioskRuntime::apply_event_response(bool parsed, const kiosk::protocol::Even
     case ApplyResult::APPLIED:
     case ApplyResult::APPLIED_IDENTICAL: {
       bool is_err = resp.kind == EventOutcomeKind::BUSINESS_REJECTED;
+      // Shadow-mode journal: the one clean terminal transition -- the
+      // server gave a real, parsed, applied business answer. ACKED for a
+      // genuine accept, REJECTED for a genuine business rejection (never
+      // guessed; this is exactly what resp.kind already tells us).
+      {
+        kiosk::protocol::JournalTransition jt;
+        jt.event_id = event_id;
+        jt.sync_status = is_err ? kiosk::protocol::JournalSyncStatus::REJECTED
+                                : kiosk::protocol::JournalSyncStatus::ACKED;
+        jt.last_error_code = is_err ? resp.error_code : "";
+        jt.last_attempt_uptime_ms = millis();
+        journal_.append_transition(jt);
+      }
       // Fresh entry into QUANTITY_INPUT (from SESSION_ACTIVE via rescan or
       // the FINISH_REQUESTED shortcut) always starts the local GOOD/DEFECT/
       // REWORK sub-flow at GOOD. A response that LEAVES the device in
@@ -633,7 +875,7 @@ void KioskRuntime::apply_event_response(bool parsed, const kiosk::protocol::Even
       break;
     case ApplyResult::REJECTED_UNSUPPORTED:
       kiosk::health::log_structured("ERROR", "STATE_UNSUPPORTED", "kiosk_runtime", event_id.c_str());
-      render_current_business_state("Trang thai server khong duoc ho tro (firmware cu?)", true, true);
+      render_current_business_state("Trạng thái server không được hỗ trợ (firmware cũ?)", true, true);
       break;
   }
 }

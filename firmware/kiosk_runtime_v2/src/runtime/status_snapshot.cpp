@@ -3,6 +3,7 @@
 #include <WiFi.h>
 
 #include "../config/build_info.h"
+#include "../health/recovery_supervisor.h"
 #include "../protocol/protocol_codec.h"  // json_escape
 
 namespace kiosk::runtime {
@@ -147,7 +148,80 @@ std::string build_status_json(kiosk::security::DeviceIdentity& identity,
   json += "\"server_ca_loaded\":false,";
   json += "\"client_cert_loaded\":false,";
   json += "\"certificate_status\":\"NONE\"";
-  json += "}";
+  json += "},";
+
+  // Phase 3A durable journal (shadow mode) -- §12 of the task. No
+  // event_id/payload contents here by design ("No secrets/payload contents
+  // needed by default").
+  {
+    const auto& j = runtime.journal();
+    auto counts = j.counts();
+    uint32_t now_ms = static_cast<uint32_t>(millis());
+    uint32_t oldest_age = j.oldest_pending_age_ms(now_ms);
+    json += "\"journal\":{";
+    json += std::string("\"init_ok\":") + (j.init_ok() ? "true" : "false") + ",";
+    json += "\"capacity_bytes\":" + std::to_string(j.capacity_bytes()) + ",";
+    json += "\"used_bytes\":" + std::to_string(j.used_bytes()) + ",";
+    json += "\"free_bytes\":" + std::to_string(j.capacity_bytes() > j.used_bytes()
+                                                    ? j.capacity_bytes() - j.used_bytes() : 0) + ",";
+    char pct_buf[16];
+    snprintf(pct_buf, sizeof(pct_buf), "%.2f", j.usage_pct());
+    json += std::string("\"usage_pct\":") + pct_buf + ",";
+    const char* pressure_str = "NORMAL";
+    switch (j.pressure()) {
+      case kiosk::protocol::JournalPressure::NORMAL: pressure_str = "NORMAL"; break;
+      case kiosk::protocol::JournalPressure::WARNING: pressure_str = "WARNING"; break;
+      case kiosk::protocol::JournalPressure::RESTRICTED: pressure_str = "RESTRICTED"; break;
+      case kiosk::protocol::JournalPressure::FULL: pressure_str = "FULL"; break;
+    }
+    json += std::string("\"pressure\":\"") + pressure_str + "\",";
+    json += "\"records\":" + std::to_string(j.record_count()) + ",";
+    json += "\"pending\":" + std::to_string(counts.pending) + ",";
+    json += "\"inflight\":" + std::to_string(counts.in_flight) + ",";
+    json += "\"acked\":" + std::to_string(counts.acked) + ",";
+    json += "\"rejected\":" + std::to_string(counts.rejected) + ",";
+    json += "\"conflicts\":" + std::to_string(counts.conflict) + ",";
+    json += "\"human_review\":" + std::to_string(counts.human_review) + ",";
+    if (oldest_age == 0xFFFFFFFFu) {
+      json += "\"oldest_pending_age_s\":null";
+    } else {
+      json += "\"oldest_pending_age_s\":" + std::to_string(oldest_age / 1000);
+    }
+    // §1 of the 2026-08-25 follow-up: incremental compaction progress, so
+    // QA tooling/an operator can see a multi-tick compaction actually
+    // making progress rather than just a silent pause.
+    json += std::string(",\"compaction_active\":") + (j.compaction_active() ? "true" : "false") + ",";
+    json += "\"compaction_records_processed\":" + std::to_string(j.compaction_records_processed()) + ",";
+    json += "\"compaction_records_total\":" + std::to_string(j.compaction_records_total()) + ",";
+    json += "\"compaction_last_progress_ms\":" + std::to_string(j.compaction_last_progress_ms());
+    json += "},";
+  }
+
+  // §22/§23 of the self-recovery task -- structured recovery codes + the
+  // bounded recovery history ring, plus reboot-loop protection's current
+  // SAFE_MODE flag. Never any business/payload data here, same "coarse
+  // operational status only" rule the rest of this function already
+  // follows.
+  {
+    json += "\"recovery\":{";
+    json += std::string("\"safe_mode\":") + (kiosk::health::is_safe_mode() ? "true" : "false") + ",";
+    json += "\"same_fault_streak\":" + std::to_string(kiosk::health::same_fault_streak()) + ",";
+    json += "\"history\":[";
+    int count = kiosk::health::recovery_history_count();
+    for (int i = 0; i < count; ++i) {
+      if (i > 0) json += ",";
+      const auto& e = kiosk::health::recovery_history_at(i);
+      json += "{";
+      json += std::string("\"code\":\"") + kiosk::health::recovery_code_to_string(e.code) + "\",";
+      json += "\"detail\":\"" + kiosk::protocol::json_escape(e.detail) + "\",";
+      json += "\"uptime_ms\":" + std::to_string(e.uptime_ms) + ",";
+      json += "\"journal_pressure\":" + std::to_string(e.journal_pressure) + ",";
+      json += "\"memory_free_bytes\":" + std::to_string(e.memory_free_bytes) + ",";
+      json += "\"memory_largest_block_bytes\":" + std::to_string(e.memory_largest_block_bytes);
+      json += "}";
+    }
+    json += "]}";
+  }
 
   json += "}";
   return json;

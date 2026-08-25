@@ -8,9 +8,17 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+#include <esp_heap_caps.h>
 
 #include "src/config/hardware_pins.h"
 #include "src/debug/debug_server.h"
+#include "src/health/low_memory_supervisor.h"
+#include "src/health/memory_diag.h"
+#include "src/health/recovery_supervisor.h"
+#include "src/health/structured_log.h"
 #include "src/hardware/display.h"
 #include "src/hardware/hardware_selftest.h"
 #include "src/hardware/keypad_pcf8574.h"
@@ -28,6 +36,7 @@
 #include "src/runtime/wifi_recovery_controller.h"
 #include "src/security/device_identity.h"
 #include "src/storage/config_store.h"
+#include "src/storage/event_journal.h"
 #include "src/storage/ui_bundle_store.h"
 #include "src/ui/renderer.h"
 
@@ -50,9 +59,26 @@ kiosk::ui::Renderer g_renderer(g_display);
 kiosk::network::WifiManager g_wifi(g_bus);
 kiosk::network::WifiSetupPortal g_wifi_portal(g_bus, g_config, g_identity);
 kiosk::storage::UiBundleStore g_ui_bundle_store;
-kiosk::runtime::KioskRuntime g_runtime(g_bus, g_renderer, g_config, g_identity, g_time_sync, g_ui_bundle_store);
+// Phase 3A durable journal (docs/OFFLINE.md), SHADOW MODE only -- see
+// kiosk_runtime.cpp's send_business_event()/apply_event_response(). 256KB
+// out of the SPIFFS partition's 1.5MB (0x180000), leaving well over 1MB
+// free for UI bundle A/B slots (each ~4KB) plus headroom -- see the Phase
+// 3A report for the real measured SPIFFS numbers this was sized against.
+constexpr uint32_t kJournalCapacityBytes = 256u * 1024u;
+kiosk::storage::EventJournal g_journal;
+kiosk::runtime::KioskRuntime g_runtime(g_bus, g_renderer, g_config, g_identity, g_time_sync, g_ui_bundle_store,
+                                       g_journal);
 kiosk::runtime::UiSyncController g_ui_sync(g_ui_bundle_store);
-kiosk::runtime::WifiRecoveryController g_wifi_recovery(g_bus, g_renderer, g_wifi_portal);
+// §4 of the 2026-08-25 finish-anti-stuck-recovery follow-up -- the recovery
+// menu's "RETRY NETWORK"/"RESYNC" actions forwarded in as callbacks (see
+// WifiRecoveryController's own header comment for why: it must not depend
+// on WifiManager's/KioskRuntime's concrete types). Safe to reference g_wifi/
+// g_runtime here even though this line runs before either's begin()/init()
+// -- these lambdas aren't INVOKED until the operator actually picks a menu
+// option, long after both are fully set up.
+kiosk::runtime::WifiRecoveryController g_wifi_recovery(
+    g_bus, g_renderer, g_wifi_portal, [] { g_wifi.retry_now(); },
+    [] { g_runtime.request_manual_resync(); }, [] { g_runtime.refresh_idle_screen(); });
 kiosk::network::BootstrapClient g_bootstrap;
 
 kiosk::hardware::SelfTestResult g_selftest;
@@ -72,8 +98,58 @@ kiosk::debug::DebugServer g_debug_server(g_bus, g_display, g_renderer, g_runtime
 unsigned long g_last_diagnostics_print_ms = 0;
 constexpr unsigned long kDiagnosticsPrintIntervalMs = 30000;
 
+// §6 of the 2026-08-25 finish-anti-stuck-recovery follow-up: lightweight UI
+// stall detection. g_display.frame_id() (bumped once per Renderer::end_screen()
+// call -- already existed, this just reuses it) is the "render_generation"
+// the task asks for; g_renderer.current_screen_id() is "last_screen_id".
+// Honest limitation: this can only ever catch a loop() that is STILL
+// RUNNING but somehow not rendering -- a genuinely hung loop() (the display
+// SPI transaction itself blocking forever, say) would also freeze this
+// check, since it runs on the same task. Real value is still there: most
+// realistic "stuck" cases (nothing left to trigger a redraw, not the loop
+// itself dying) are exactly what this catches.
+uint32_t g_last_seen_frame_id = 0;
+unsigned long g_last_render_progress_ms = 0;
+bool g_ui_stall_redraw_attempted = false;
+bool g_ui_stall_display_reinit_attempted = false;
+// 5 minutes -- long enough that a genuinely idle WAIT_EMPLOYEE screen
+// (nothing SHOULD redraw for a while) never false-positives, short enough
+// to matter for an operator who's actually stuck.
+constexpr unsigned long kUiStallThresholdMs = 300000;
+
+// Auto-compaction (2026-08-24, self-recovery task) -- checked on the same
+// cadence as the periodic diagnostics print above, not tied to it: compact()
+// itself is a fast no-op (JOURNAL_COMPACTION_SKIP) whenever nothing is over
+// its retention count, so checking every 30s costs nothing when there's
+// nothing to do, and catches real pressure promptly when there is.
+unsigned long g_last_compaction_check_ms = 0;
+constexpr unsigned long kCompactionCheckIntervalMs = 30000;
+// Tracks the active->inactive edge across compact_tick() calls (2026-08-25)
+// so the AFTER memory snapshot logs exactly once, when the (possibly
+// multi-tick) compaction actually finishes, not right after begin_compaction()
+// merely starts it.
+bool g_compaction_was_active = false;
+
 bool g_bootstrap_attempted = false;
 bool g_time_sync_started = false;
+
+// Real race found live (2026-08-24): WiFi.status()==WL_CONNECTED can flip
+// true a short moment before the DHCP client has actually finished (no
+// usable default gateway/DNS yet) -- bootstrap firing on the very FIRST
+// loop() iteration after CONNECTED can hit http.POST() failing almost
+// instantly (status<=0, "no response from backend" within ~130ms --
+// nowhere near RUNTIME_HTTP_TIMEOUT_MS, so this is a fast connect-level
+// failure, not a real timeout). Reproduced 2/2 on a cold boot. Since
+// bootstrap only ever fired ONCE per boot with no retry, a device that
+// hit this race stayed on state=null (no business state at all) for the
+// rest of that boot. Retry a bounded number of times with a short cooldown
+// -- only a TRANSPORT-level failure (BootstrapStatus::FAILED) retries;
+// a real response (OK or a business REJECTED) still marks this done
+// immediately, same as before.
+constexpr int kBootstrapMaxAttempts = 5;
+constexpr unsigned long kBootstrapRetryCooldownMs = 3000;
+int g_bootstrap_attempt_count = 0;
+unsigned long g_bootstrap_next_attempt_ms = 0;
 
 void keypad_calibration_prompt(char key, uint8_t index, uint8_t total) {
   g_renderer.draw_keypad_calibration_prompt(key, index, total);
@@ -97,9 +173,26 @@ void setup() {
   Serial.printf("{\"level\":\"INFO\",\"code\":\"PROFILE\",\"profile\":\"%s\"}\n",
                 MESFLOW_PROFILE_NAME);
 
+#if MESFLOW_DEBUG_API
+  kiosk::health::log_memory_snapshot("BOOT_EARLY");
+#endif
+
+  // §13 of the self-recovery task -- reads any PERSISTED same-fault reboot
+  // streak from NVS as early as possible, before anything else this boot
+  // could itself crash on. PROD+DEV both (this is a safety feature, not a
+  // debug tool).
+  kiosk::health::recovery_supervisor_init();
+
   g_config.init();
   g_identity.init();
   g_ui_bundle_store.init();  // loads last-known-good UI bundle from NVS, if any (§5/§16)
+#if MESFLOW_DEBUG_API
+  kiosk::health::log_memory_snapshot("AFTER_UI_BUNDLE_LOAD");
+#endif
+  g_journal.init(kJournalCapacityBytes);  // Phase 3A: recovers the durable event journal's index (SPIFFS-backed, shadow mode)
+#if MESFLOW_DEBUG_API
+  kiosk::health::log_memory_snapshot("AFTER_JOURNAL_INIT");
+#endif
 
   String boot_id = kiosk::protocol::generate_random_hex_id(8).c_str();
 
@@ -107,8 +200,17 @@ void setup() {
   // display.cpp's Display::init()) now lives entirely inside Display::init()
   // itself, so display bring-up has exactly one owner.
   g_selftest.display_ok = g_display.init();
+#if MESFLOW_DEBUG_API
+  kiosk::health::log_memory_snapshot("AFTER_DISPLAY_INIT");
+#endif
   g_selftest.scanner_ok = g_scanner.init();
+#if MESFLOW_DEBUG_API
+  kiosk::health::log_memory_snapshot("AFTER_SCANNER_INIT");
+#endif
   g_selftest.keypad_ok = g_keypad.init();  // false = DEGRADED, not fatal
+#if MESFLOW_DEBUG_API
+  kiosk::health::log_memory_snapshot("AFTER_KEYPAD_INIT");
+#endif
 
   g_diagnostics = kiosk::runtime::collect_boot_diagnostics(boot_id);
 
@@ -129,26 +231,66 @@ void setup() {
   g_runtime.refresh_idle_screen();
 
   g_wifi.begin(g_config.wifi_ssid(), g_config.wifi_password());
+#if MESFLOW_DEBUG_API
+  kiosk::health::log_memory_snapshot("AFTER_WIFI_INIT");
+#endif
 
 #if MESFLOW_DEBUG_API
-  // TEMPORARY diagnostic fix (real bug found live, 2026-08-23): on a
-  // genuinely fresh/never-provisioned board (blank NVS, no Wi-Fi
-  // credentials ever saved), WifiManager::begin() correctly short-circuits
-  // without ever calling WiFi.mode()/WiFi.begin() -- but DebugServer::begin()
-  // (WebServer::begin()) unconditionally assumes the WiFi/LWIP stack is
-  // already initialized, and asserts (`xQueueSemaphoreTake queue.c:1709`)
-  // almost immediately after setup() if it never was. This crash-loops
-  // before loop() ever runs once, meaning it can't even be worked around
-  // via a serial command. Confirmed: our provisioned kiosk board (which has
-  // always had Wi-Fi credentials since Phase 0) never hits this path.
-  // Calling WiFi.mode(WIFI_STA) unconditionally -- even with no SSID yet --
-  // is enough to initialize the stack without actually attempting a
-  // connection. Left here as a real fix candidate; revisit whether this
-  // should be unconditional in WifiManager::begin() itself instead of only
-  // guarded here.
-  WiFi.mode(WIFI_STA);
-  g_debug_server.begin();
+  // §2 of the 2026-08-25 finish-anti-stuck-recovery follow-up: SAFE_MODE
+  // avoids "heavy debug services" -- the debug HTTP server (screenshot/
+  // ui-state/device-state over HTTP) is exactly that, so it's skipped
+  // entirely while SAFE_MODE is active. Serial debug commands (including
+  // the fault-injection test hooks below) are UNAFFECTED -- they don't go
+  // through g_debug_server at all, so SAFE_MODE force-testing itself never
+  // depends on the thing SAFE_MODE is deliberately not starting.
+  if (!kiosk::health::is_safe_mode()) {
+    // TEMPORARY diagnostic fix (real bug found live, 2026-08-23): on a
+    // genuinely fresh/never-provisioned board (blank NVS, no Wi-Fi
+    // credentials ever saved), WifiManager::begin() correctly short-circuits
+    // without ever calling WiFi.mode()/WiFi.begin() -- but DebugServer::begin()
+    // (WebServer::begin()) unconditionally assumes the WiFi/LWIP stack is
+    // already initialized, and asserts (`xQueueSemaphoreTake queue.c:1709`)
+    // almost immediately after setup() if it never was. This crash-loops
+    // before loop() ever runs once, meaning it can't even be worked around
+    // via a serial command. Confirmed: our provisioned kiosk board (which has
+    // always had Wi-Fi credentials since Phase 0) never hits this path.
+    // Calling WiFi.mode(WIFI_STA) unconditionally -- even with no SSID yet --
+    // is enough to initialize the stack without actually attempting a
+    // connection. Left here as a real fix candidate; revisit whether this
+    // should be unconditional in WifiManager::begin() itself instead of only
+    // guarded here.
+    WiFi.mode(WIFI_STA);
+    g_debug_server.begin();
+    kiosk::health::log_memory_snapshot("AFTER_DEBUG_SERVER_INIT");
+
+    // §6 of the 2026-08-24 open-AP rework: pause the (unauthenticated,
+    // DEV-only) debug HTTP API for as long as the now password-less setup AP
+    // is up -- see DebugServer::set_paused()'s comment. Serial debug commands
+    // are unaffected (don't go through web_ at all).
+    g_bus.subscribe([](const kiosk::runtime::LocalEvent& event) {
+      if (event.kind != kiosk::runtime::LocalEventKind::WIFI_RECOVERY_STATE) return;
+      g_debug_server.set_paused(event.text != "INACTIVE");
+    });
+  } else {
+    kiosk::health::log_structured("WARN", "SAFE_MODE_BOOT", "kiosk_runtime_v2",
+                                  "SAFE_MODE active -- debug HTTP server not started (serial commands still work)");
+  }
 #endif
+
+  // §3 of the 2026-08-24 open-AP rework: the setup AP must never be
+  // permanent -- it only runs when (a) there are no usable stored Wi-Fi
+  // credentials, (b) the operator holds '*' for 10s, or (c) an explicit
+  // recovery mode is entered. (b)/(c) are handled entirely by
+  // WifiRecoveryController/WifiSetupPortal already; this is (a), which
+  // previously had no code path at all -- a fresh/never-provisioned board
+  // just sat DISCONNECTED forever with no way back in except the physical
+  // '*' hold (which itself requires keypad calibration to have already run
+  // -- see docs/WIFI_RECOVERY.md's "Prerequisite" section). Runs AFTER the
+  // WiFi.mode(WIFI_STA) debug-server workaround above so it always wins:
+  // WifiSetupPortal::start() sets WIFI_AP_STA itself.
+  if (g_config.wifi_ssid().length() == 0) {
+    g_wifi_portal.start("no_credentials");
+  }
 }
 
 namespace {
@@ -158,8 +300,10 @@ namespace {
 //
 //   wifi:<ssid>,<password>    save Wi-Fi creds directly to NVS, then reboot
 //   keypad-calibrate          run the guided 12-key calibration (blocking)
-//   recovery-info             print this device's Wi-Fi recovery AP SSID/password
-//                             (read-only; does not start the portal)
+//   recovery-info             print this device's Wi-Fi recovery AP SSID
+//                             (ap_password is always "" -- the AP is open,
+//                             no password, see docs/WIFI_RECOVERY.md).
+//                             Read-only; does not start the portal.
 //   display-test              DEV-only physical display diagnostic: drives the
 //                             REAL display hardware (not just the shadow
 //                             framebuffer) through white/black/red/green/blue/
@@ -480,6 +624,42 @@ void poll_serial_provisioning() {
         // real state transitions for visual-parity testing when there's no
         // HTTP path to the device and no physical scanner/keypad access.
         g_debug_server.write_input_result_serial(std::string(line.substring(12).c_str()), Serial);
+      } else if (line == "force-task-create-failure") {
+        // §8 of the 2026-08-25 finish-anti-stuck-recovery follow-up: makes
+        // the NEXT event send's xTaskCreate() fail exactly like a real
+        // API_ERR_TASK_CREATE_FAILED, so kiosk_runtime.cpp's retry-once ->
+        // controlled-reboot recovery path can be exercised and proven on
+        // real hardware without needing to actually exhaust internal SRAM.
+        // Reproducible/automatable: tools/kiosk_test_runner.py's
+        // --mode targeted --scenario task_create_failure sends this over
+        // serial, then drives a scan and checks the recovery outcome.
+        g_runtime.force_next_task_create_failure_for_test();
+        Serial.println("{\"level\":\"INFO\",\"code\":\"API_FAULT_ARMED\",\"module\":\"kiosk_runtime_v2\","
+                       "\"message\":\"next event send's xTaskCreate will be forced to fail\"}");
+      } else if (line.startsWith("simulate-compaction-crash:")) {
+        // §10 of the 2026-08-25 follow-up: sets up the exact on-disk file
+        // state a real crash would leave at one of compact()'s 5
+        // interruption windows, then reboots so the NEXT boot's real
+        // init() orphan-recovery logic is what actually recovers it (not
+        // this test hook) -- see event_journal.h's own comment for the
+        // scenario numbers.
+        int scenario = line.substring(26).toInt();  // strlen("simulate-compaction-crash:") == 26
+        Serial.printf("Simulating compaction-crash scenario %d, rebooting...\n", scenario);
+        g_journal.simulate_compaction_crash_for_test(scenario);
+        delay(200);
+        ESP.restart();
+      } else if (line == "reinit-scanner") {
+        // §7: manual scanner re-init (see scanner_gm65.h's comment on why
+        // this has no automatic trigger).
+        g_scanner.reinit();
+        Serial.println("{\"level\":\"INFO\",\"code\":\"HW_SCANNER_REINIT_REQUESTED\",\"module\":\"kiosk_runtime_v2\"}");
+      } else if (line == "force-safe-mode") {
+        // §9: forces the persisted same-fault streak to the SAFE_MODE
+        // threshold and reboots -- verifies the REAL boot path (not just
+        // code inspection) without waiting for 3 genuine faults.
+        Serial.println("Forcing SAFE_MODE (TASK_CREATE_FAILED) and rebooting...");
+        delay(200);
+        kiosk::health::force_safe_mode_for_test(kiosk::health::RecoveryCode::TASK_CREATE_FAILED);
       }
 #endif
       line = "";
@@ -514,11 +694,34 @@ void loop() {
     }
     g_time_sync.poll();
 
-    if (!g_bootstrap_attempted) {
-      g_bootstrap_attempted = true;
+    if (!g_bootstrap_attempted && millis() >= g_bootstrap_next_attempt_ms) {
+      ++g_bootstrap_attempt_count;
+#if MESFLOW_DEBUG_API
+      kiosk::health::log_memory_snapshot("BEFORE_TLS_REQUEST");
+#endif
       auto bootstrap_result =
           g_bootstrap.attempt(g_config.api_endpoint(), g_identity.device_id(), g_identity.hardware_id(),
                               g_diagnostics.boot_id, static_cast<uint32_t>(g_runtime.device_seq()));
+#if MESFLOW_DEBUG_API
+      kiosk::health::log_memory_snapshot("AFTER_TLS_REQUEST");
+      if (g_bootstrap_attempt_count == 1) kiosk::health::log_memory_snapshot("AFTER_FIRST_BOOTSTRAP");
+#endif
+      if (bootstrap_result.status == kiosk::network::BootstrapStatus::FAILED &&
+          g_bootstrap_attempt_count < kBootstrapMaxAttempts) {
+        // Transport-level failure (see the race documented above) -- retry
+        // after a short cooldown rather than stranding the device on
+        // state=null for the rest of this boot. A real response (success
+        // OR a business rejection) falls through below and marks this done
+        // immediately, same as before.
+        g_bootstrap_next_attempt_ms = millis() + kBootstrapRetryCooldownMs;
+        kiosk::health::log_structured(
+            "INFO", "BOOTSTRAP_RETRY", "kiosk_runtime_v2",
+            (std::string("attempt=") + std::to_string(g_bootstrap_attempt_count) + "/" +
+             std::to_string(kBootstrapMaxAttempts))
+                .c_str());
+      } else {
+        g_bootstrap_attempted = true;
+      }
       // Phase 2: seed StateProjection from the SAME bootstrap response --
       // invariant 15, the device never restores a business state locally
       // across reboot, it always starts from server authority this boot.
@@ -527,10 +730,24 @@ void loop() {
       // whatever's currently active -- read once at boot (heartbeat could
       // also carry this for faster propagation without a reboot; not
       // implemented yet, see the Phase 4 report's Known Gaps).
-      g_ui_sync.check_desired(g_config.api_endpoint(), bootstrap_result.ui_bundle_version,
-                             std::string(bootstrap_result.ui_bundle_hash.c_str()));
+      //
+      // §2 of the 2026-08-25 follow-up: SAFE_MODE explicitly avoids "UI
+      // bundle sync unless needed" -- bootstrap/resync itself (the "basic
+      // backend state/resync" minimal subsystem) still runs above
+      // regardless of SAFE_MODE, only this extra network round-trip is
+      // skipped.
+      if (!kiosk::health::is_safe_mode()) {
+        g_ui_sync.check_desired(g_config.api_endpoint(), bootstrap_result.ui_bundle_version,
+                               std::string(bootstrap_result.ui_bundle_hash.c_str()));
+      }
     }
-    g_heartbeat.poll(g_config.api_endpoint());
+    // §2: heartbeat is a "nonessential worker" during SAFE_MODE -- health
+    // telemetry has no value to an operator trying to recover a stuck
+    // kiosk, and it's one more thing this loop doesn't need to spend time
+    // on while minimal.
+    if (!kiosk::health::is_safe_mode()) {
+      g_heartbeat.poll(g_config.api_endpoint());
+    }
   }
   // non-blocking: picks up a completed bundle download/verify/activate
   // (§23/§24). A REAL bug caught live via the Serial Visual Debug Fallback
@@ -539,12 +756,45 @@ void loop() {
   // with no underlying business-state transition, so the operator would
   // keep looking at stale content until some unrelated event (scan/resync/
   // keypress) happened to redraw. refresh_idle_screen() when poll()
-  // reports an activation closes that gap.
-  if (g_ui_sync.poll()) {
+  // reports an activation closes that gap. Skipped entirely in SAFE_MODE
+  // (check_desired() above never runs there, so poll() would never have
+  // anything to report anyway).
+  if (!kiosk::health::is_safe_mode() && g_ui_sync.poll()) {
     g_runtime.refresh_idle_screen();
   }
 
   unsigned long now = millis();
+  // §1 (2026-08-25 follow-up): the ROUTINE periodic trigger uses the
+  // INCREMENTAL compact_tick() API, not the one-shot compact() -- a full
+  // compaction measured ~4.2s blocking the main loop (and therefore
+  // scanner/keypad/display polling) on real hardware. compact_tick() below
+  // runs whenever a compaction is already in progress (every loop()
+  // iteration, cheap no-op otherwise); begin_compaction() only starts a new
+  // one on the 30s check, same as before.
+  if (g_journal.compaction_active()) {
+    g_journal.compact_tick();
+    g_compaction_was_active = true;
+  } else {
+    if (g_compaction_was_active) {
+      // Just finished (this tick or an earlier one moved active_ to false)
+      // -- log the AFTER snapshot exactly once, matching where the OLD
+      // one-shot call used to log it.
+      g_compaction_was_active = false;
+#if MESFLOW_DEBUG_API
+      kiosk::health::log_memory_snapshot("AFTER_JOURNAL_COMPACTION");
+#endif
+    }
+    if (now - g_last_compaction_check_ms >= kCompactionCheckIntervalMs) {
+      g_last_compaction_check_ms = now;
+      if (g_journal.should_consider_compaction()) {
+#if MESFLOW_DEBUG_API
+        kiosk::health::log_memory_snapshot("BEFORE_JOURNAL_COMPACTION");
+#endif
+        g_journal.begin_compaction();
+      }
+    }
+  }
+
   if (now - g_last_diagnostics_print_ms >= kDiagnosticsPrintIntervalMs) {
     g_last_diagnostics_print_ms = now;
     kiosk::runtime::refresh_memory_fields(g_diagnostics);
@@ -555,5 +805,89 @@ void loop() {
                   g_diagnostics.largest_free_block_bytes,
                   g_diagnostics.psram_free_bytes,
                   kiosk::runtime::is_psram_headroom_low(g_diagnostics) ? "true" : "false");
+#if MESFLOW_DEBUG_API
+    kiosk::health::log_memory_snapshot("PERIODIC_30S");
+    char stack_msg[64];
+    snprintf(stack_msg, sizeof(stack_msg), "task=loopTask high_water_words=%u",
+             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+    kiosk::health::log_structured("INFO", "TASK_STACK_DIAG", "kiosk_runtime_v2", stack_msg);
+#endif
+
+    // §11 of the self-recovery task -- low-memory supervisor. Deliberately
+    // reading INTERNAL SRAM specifically (not diagnostics.largest_free_block_bytes
+    // above, which is MALLOC_CAP_8BIT -- internal+PSRAM blended, the exact
+    // thing that looked deceptively abundant during the earlier
+    // fragmentation investigation). PROD+DEV both -- this is a safety
+    // feature, not a debug tool.
+    uint32_t internal_largest = static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    uint32_t internal_free = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    auto mem_level = kiosk::health::classify_low_memory(internal_largest);
+    if (mem_level == kiosk::health::LowMemoryLevel::WARNING) {
+      kiosk::health::record_recovery_event(kiosk::health::RecoveryCode::LOW_MEMORY,
+                                           "internal SRAM WARNING -- largest contiguous block low",
+                                           static_cast<uint8_t>(g_journal.pressure()), internal_free,
+                                           internal_largest);
+    } else if (mem_level == kiosk::health::LowMemoryLevel::CRITICAL) {
+      // Try the single most likely real fix first (fewer live JournalRecord
+      // entries in RAM directly frees heap, unlike most other "free memory"
+      // options this codebase has) -- re-check afterward before escalating.
+      if (g_journal.record_count() > 0) g_journal.compact();
+      internal_largest = static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+      internal_free = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+      if (kiosk::health::classify_low_memory(internal_largest) == kiosk::health::LowMemoryLevel::CRITICAL) {
+        kiosk::health::request_controlled_reboot(
+            kiosk::health::RecoveryCode::LOW_MEMORY,
+            "internal SRAM CRITICAL even after journal compaction -- no more application-level relief available",
+            static_cast<uint8_t>(g_journal.pressure()), internal_free, internal_largest);
+        // never returns.
+      }
+      kiosk::health::record_recovery_event(kiosk::health::RecoveryCode::LOW_MEMORY,
+                                           "internal SRAM was CRITICAL, journal compaction recovered it",
+                                           static_cast<uint8_t>(g_journal.pressure()), internal_free,
+                                           internal_largest);
+    }
+
+    // §13: uptime has been stable through a full periodic-check cycle with
+    // no recovery reboot needed -- safe to clear any persisted same-fault
+    // streak from a PAST boot's incident so it doesn't eventually
+    // accumulate into a false SAFE_MODE trip from sparse, unrelated events
+    // months apart. A genuine rapid reboot LOOP never reaches this line (it
+    // crashes/reboots well before kDiagnosticsPrintIntervalMs's first tick).
+    kiosk::health::recovery_supervisor_mark_stable();
+
+    // §6: UI stall detection (see g_last_seen_frame_id's own comment above
+    // for the honest scope/limitation).
+    uint32_t frame_id = g_display.frame_id();
+    if (frame_id != g_last_seen_frame_id) {
+      g_last_seen_frame_id = frame_id;
+      g_last_render_progress_ms = now;
+      g_ui_stall_redraw_attempted = false;
+      g_ui_stall_display_reinit_attempted = false;
+    } else if (now - g_last_render_progress_ms >= kUiStallThresholdMs) {
+      if (!g_ui_stall_redraw_attempted) {
+        g_ui_stall_redraw_attempted = true;
+        kiosk::health::record_recovery_event(kiosk::health::RecoveryCode::UI_STALL,
+                                             "no render in 5min -- forcing one redraw",
+                                             static_cast<uint8_t>(g_journal.pressure()), 0, 0);
+        g_runtime.refresh_idle_screen();
+      } else if (!g_ui_stall_display_reinit_attempted) {
+        g_ui_stall_display_reinit_attempted = true;
+        kiosk::health::record_recovery_event(kiosk::health::RecoveryCode::UI_STALL,
+                                             "forced redraw didn't advance frame_id -- reinitializing display",
+                                             static_cast<uint8_t>(g_journal.pressure()), 0, 0);
+        g_display.init();
+        g_runtime.refresh_idle_screen();
+      } else {
+        // Forced redraw AND a display reinit both failed to advance
+        // frame_id -- genuinely unrecoverable at this layer.
+        uint32_t mem_free = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        uint32_t mem_largest = static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        kiosk::health::request_controlled_reboot(
+            kiosk::health::RecoveryCode::UI_STALL,
+            "display reinit did not recover rendering -- unrecoverable at this layer",
+            static_cast<uint8_t>(g_journal.pressure()), mem_free, mem_largest);
+        // never returns.
+      }
+    }
   }
 }

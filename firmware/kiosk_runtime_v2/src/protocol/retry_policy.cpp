@@ -16,23 +16,24 @@ HttpOutcome classify_http_result(int raw_status, int retry_after_header_s) {
 
   if (raw_status <= 0) {
     // Transport-level failure (no HTTP status ever received). Map known
-    // ESP32 HTTPClient negative codes to specific taxonomy codes; anything
-    // else (including this codebase's own -999 hard-deadline marker) buckets
-    // to the generic NET_CONNECT_FAIL/NET_TIMEOUT as appropriate.
+    // ESP32 HTTPClient negative codes to the simplified taxonomy; anything
+    // else buckets to the generic TCP_CONNECT_FAIL/HTTP_TIMEOUT as
+    // appropriate.
     switch (raw_status) {
-      case -1:  // HTTPC_ERROR_CONNECTION_REFUSED
-        out.error_code = "NET_CONNECT_REFUSED";
+      case kDnsFailMarker:  // pre-flight WiFi.hostByName() failed -- no TCP attempt was even made
+        out.error_code = "DNS_FAIL";
         break;
       case -11:  // HTTPC_ERROR_READ_TIMEOUT
       case -999:  // this codebase's own hard-deadline-exceeded marker
-        out.error_code = "NET_TIMEOUT";
+        out.error_code = "HTTP_TIMEOUT";
         break;
+      case -1:   // HTTPC_ERROR_CONNECTION_REFUSED
       case -4:   // HTTPC_ERROR_NOT_CONNECTED
       case -5:   // HTTPC_ERROR_CONNECTION_LOST
-        out.error_code = "NET_CONNECT_FAIL";
+        out.error_code = "TCP_CONNECT_FAIL";
         break;
       default:
-        out.error_code = raw_status == 0 ? "NET_TIMEOUT" : "NET_CONNECT_FAIL";
+        out.error_code = raw_status == 0 ? "HTTP_TIMEOUT" : "TCP_CONNECT_FAIL";
         break;
     }
     out.retryable = true;
@@ -47,7 +48,7 @@ HttpOutcome classify_http_result(int raw_status, int retry_after_header_s) {
     return out;
   }
   if (raw_status >= 500 && raw_status < 600) {
-    out.error_code = "API_HTTP_5XX";
+    out.error_code = "HTTP_5XX";
     out.retryable = true;
     return out;
   }
@@ -55,7 +56,7 @@ HttpOutcome classify_http_result(int raw_status, int retry_after_header_s) {
     // §21: 400 (and other 4xx) -> no blind retry. 401/403 are also 4xx here
     // -- Phase 1 doesn't yet have a real auth handshake to react to them
     // differently; that's a later integration point, not invented here.
-    out.error_code = "API_HTTP_4XX";
+    out.error_code = "HTTP_4XX";
     out.retryable = false;
     return out;
   }

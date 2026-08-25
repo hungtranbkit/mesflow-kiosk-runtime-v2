@@ -1,6 +1,7 @@
 #include "scanner_gm65.h"
 
 #include "../config/runtime_config.h"
+#include "../health/structured_log.h"
 
 namespace kiosk::hardware {
 
@@ -9,6 +10,14 @@ bool ScannerGm65::init() {
   serial_.begin(SCANNER_BAUD, SERIAL_8N1, PIN_SCANNER_RX, PIN_SCANNER_TX);
   buffer_.reserve(kMaxLineLength);
   return true;  // UART begin() has no failure signal to check on this core
+}
+
+void ScannerGm65::reinit() {
+  buffer_ = "";  // drop whatever partial line was mid-flight -- it's stale after a UART re-attach
+  serial_.end();
+  init();
+  kiosk::health::log_structured("INFO", "HW_SCANNER_REINIT", "scanner_gm65",
+                                "manual re-init (DEV serial command)");
 }
 
 void ScannerGm65::poll() {

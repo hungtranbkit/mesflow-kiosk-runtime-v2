@@ -22,20 +22,24 @@ int main() {
     check(ok.ok && ok.error_code.empty(), "200 -> ok, no error_code");
 
     auto timeout = classify_http_result(-11);
-    check(!timeout.ok && timeout.error_code == "NET_TIMEOUT" && timeout.retryable,
-          "-11 (read timeout) -> NET_TIMEOUT, retryable");
+    check(!timeout.ok && timeout.error_code == "HTTP_TIMEOUT" && timeout.retryable,
+          "-11 (read timeout) -> HTTP_TIMEOUT, retryable");
 
     auto hard_deadline = classify_http_result(-999);
-    check(!hard_deadline.ok && hard_deadline.error_code == "NET_TIMEOUT" && hard_deadline.retryable,
-          "-999 (our hard-deadline marker) -> NET_TIMEOUT, retryable");
+    check(!hard_deadline.ok && hard_deadline.error_code == "HTTP_TIMEOUT" && hard_deadline.retryable,
+          "-999 (our hard-deadline marker) -> HTTP_TIMEOUT, retryable");
 
     auto refused = classify_http_result(-1);
-    check(refused.error_code == "NET_CONNECT_REFUSED" && refused.retryable,
-          "-1 (connection refused) -> NET_CONNECT_REFUSED, retryable");
+    check(refused.error_code == "TCP_CONNECT_FAIL" && refused.retryable,
+          "-1 (connection refused) -> TCP_CONNECT_FAIL, retryable");
+
+    auto dns_fail = classify_http_result(kDnsFailMarker);
+    check(dns_fail.error_code == "DNS_FAIL" && dns_fail.retryable,
+          "kDnsFailMarker (pre-flight WiFi.hostByName() failure) -> DNS_FAIL, retryable");
 
     auto bad_request = classify_http_result(400);
-    check(!bad_request.retryable && bad_request.error_code == "API_HTTP_4XX",
-          "400 -> API_HTTP_4XX, NOT retryable (no blind retry)");
+    check(!bad_request.retryable && bad_request.error_code == "HTTP_4XX",
+          "400 -> HTTP_4XX, NOT retryable (no blind retry)");
 
     auto unauthorized = classify_http_result(401);
     check(!unauthorized.retryable, "401 -> not retryable");
@@ -44,10 +48,10 @@ int main() {
     check(!forbidden.retryable, "403 -> not retryable");
 
     auto server_error = classify_http_result(500);
-    check(server_error.retryable && server_error.error_code == "API_HTTP_5XX",
-          "500 -> API_HTTP_5XX, retryable");
+    check(server_error.retryable && server_error.error_code == "HTTP_5XX",
+          "500 -> HTTP_5XX, retryable");
     auto unavailable = classify_http_result(503);
-    check(unavailable.retryable && unavailable.error_code == "API_HTTP_5XX", "503 -> API_HTTP_5XX, retryable");
+    check(unavailable.retryable && unavailable.error_code == "HTTP_5XX", "503 -> HTTP_5XX, retryable");
 
     auto rate_limited = classify_http_result(429, 30);
     check(rate_limited.retryable && rate_limited.error_code == "API_RATE_LIMITED" &&

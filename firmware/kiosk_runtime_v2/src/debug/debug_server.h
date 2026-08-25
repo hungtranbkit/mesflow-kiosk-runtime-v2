@@ -31,9 +31,16 @@ namespace kiosk::debug {
 // DEV/LAB profile ONLY (§14) -- gated at compile time by MESFLOW_DEBUG_API,
 // not by any runtime check. A production build must not define this macro.
 //
-// Runs its own WebServer on MESFLOW_DEBUG_API_PORT (8081), deliberately
-// separate from the Wi-Fi recovery portal's port 80, so this keeps working
-// even while that portal is active (§17).
+// Runs its own WebServer on MESFLOW_DEBUG_API_PORT (8081), a different port
+// from the Wi-Fi setup portal's port 80. Originally (§17) this deliberately
+// kept running through recovery too, back when the recovery AP required its
+// own per-device WPA2 password. Since the 2026-08-24 open-AP rework made
+// that AP password-less, this is explicitly PAUSED (socket closed, see
+// set_paused()) for as long as the setup AP is up -- an unauthenticated
+// device-state/business-event-injection API has no business being reachable
+// from a network anyone in radio range can join with no credentials at
+// all. See kiosk_runtime_v2.ino's WIFI_RECOVERY_STATE handling and
+// docs/WIFI_RECOVERY.md's security note.
 //
 // Endpoints:
 //   GET  /debug/screenshot    current framebuffer, custom binary format
@@ -109,6 +116,21 @@ class DebugServer {
   void begin();
   void poll();  // call every loop() iteration
 
+  // §6 of the 2026-08-24 open-AP rework: the Wi-Fi setup AP is now
+  // password-less, so anyone within radio range can join it -- this HTTP
+  // debug API (full device-state read AND business-event injection via
+  // POST /debug/input, unauthenticated by design, DEV/LAB profile only)
+  // must not be reachable from it. Previously this deliberately stayed up
+  // through recovery (see the old §17 comment above) when the recovery AP
+  // still required its own per-device WPA2 password; an OPEN AP changes
+  // that trade-off entirely. Call with true when the setup AP goes active,
+  // false when it goes back to INACTIVE -- see kiosk_runtime_v2.ino's
+  // WIFI_RECOVERY_STATE handling. Serial fallback (debug-screenshot/
+  // debug-ui-state/debug-device-state/debug-input over USB) is NOT
+  // affected -- it doesn't go through web_ at all, so QA tooling
+  // (tools/kiosk_test_runner.py) keeps working during recovery too.
+  void set_paused(bool paused);
+
   // --- Serial fallback (§ "Serial Visual Debug Fallback") ---
   // The HTTP endpoints above require the host to be on the same LAN/subnet
   // as the device's WiFi -- not always true (e.g. a dev laptop on a
@@ -169,6 +191,7 @@ class DebugServer {
 
   WebServer web_{MESFLOW_DEBUG_API_PORT};
   unsigned long last_screenshot_ms_ = 0;
+  bool paused_ = false;  // true while the open setup AP is active -- see set_paused()
 
   // --- Test-runner observability (pure diagnostics, never read by any
   // business logic) ---

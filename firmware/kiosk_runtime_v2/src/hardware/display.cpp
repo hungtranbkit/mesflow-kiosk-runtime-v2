@@ -51,22 +51,6 @@ void Display::clear(uint16_t color) {
   fillScreen(color);
 }
 
-void Display::draw_line(int line_index, const char* text, uint16_t color) {
-  const int line_height = 18;
-  setCursor(4, 4 + line_index * line_height);
-  setTextColor(color, ILI9341_BLACK);
-  setTextSize(1);
-  // §7/UI_TEXT_OVERFLOW: this fixed layout has no line-wrapping model at
-  // all (each row is exactly one line). Adafruit_GFX's default text WRAP
-  // was letting an over-length string spill onto the next row and corrupt
-  // whatever was drawn there (a real bug found via an actual screenshot,
-  // not by inspection of this code) -- clip at the screen edge instead.
-  // Renderer::emit_line is responsible for logging the overflow
-  // diagnostic; this only prevents the corruption.
-  setTextWrap(false);
-  print(text);
-}
-
 void Display::mirror_pixel(int16_t x, int16_t y, uint16_t color) {
   if (framebuffer_ == nullptr) return;
   if (x < 0 || y < 0 || x >= width() || y >= height()) return;

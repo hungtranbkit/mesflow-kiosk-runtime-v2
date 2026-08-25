@@ -70,6 +70,24 @@ class Renderer {
   void draw_wifi_portal_testing(const String& ssid);
   void draw_wifi_portal_failed(const String& message);
 
+  // --- Self-recovery UI (2026-08-25 finish-anti-stuck-recovery follow-up) ---
+  // Both are ESP32-built-in emergency screens too, same reasoning as the
+  // Wi-Fi ones above: hardcoded, never backend/bundle-driven, must render
+  // with no server and no valid UI bundle.
+
+  // §3: persistent screen shown for the ENTIRE SAFE_MODE boot (KioskRuntime
+  // gates all normal rendering behind kiosk::health::is_safe_mode(), see
+  // render_current_business_state()) -- reason_code is whatever
+  // kiosk::health::safe_mode_reason() returned (a RecoveryCode string, e.g.
+  // "RECOVERY_TASK_CREATE_FAILED"), "" if none persisted.
+  void draw_safe_mode_screen(const String& reason_code, WifiIndicator wifi);
+
+  // §4: the local recovery menu opened by holding '*' ~5s
+  // (WifiRecoveryController). Fixed 5 options, no submenu, no per-item
+  // dynamic content beyond the header -- deliberately simple per the task's
+  // own "keep it simple, no fancy layout work".
+  void draw_recovery_menu(WifiIndicator wifi);
+
   // --- Device identity / provisioning (§5/§36) ---
   // Shown as the persistent idle screen whenever provisioning_state is not
   // ACTIVE, in place of the normal waiting screen -- an unprovisioned or
@@ -232,6 +250,25 @@ class Renderer {
   // text-size multiplier), clamped/rejected if it would land outside the
   // physical screen. Records into components_[] for /debug/ui-state.
   void emit_component_text(int16_t x, int16_t y, const String& text, uint16_t color, uint8_t font_size);
+  // Vietnamese-capable glyph blit (2026-08-24, replacing Adafruit_GFX's
+  // stock ASCII-only default font for all component/measured text -- see
+  // src/protocol/vn_font_core.h/src/ui/vn_font_data.h). Draws each UTF-8
+  // codepoint via a binary-searched bitmap glyph, nearest-neighbor scaled
+  // by font_size (same semantics as Adafruit_GFX's own setTextSize(N)) --
+  // a codepoint with no glyph in the subset falls back to a blank
+  // ascent/2-wide advance rather than drawing nothing at the wrong x
+  // (matches measure_text_width()'s own fallback so measured and drawn
+  // width never disagree). (x, y) is the top-left of the text, same
+  // convention emit_component_text()'s callers already use.
+  void draw_vn_text(int16_t x, int16_t y, const String& text, uint16_t color, uint8_t font_size);
+  // Draws a variable-length operator-facing message (business rejection
+  // reason, transient status) at font_size=2 for readability, falling back
+  // to 1 if it would overflow the screen width at 2 -- same
+  // try-then-step-down pattern emit_line() itself uses. transient_message
+  // strings come from the SERVER (business rejection text) or this
+  // runtime's own local messages, so length isn't bounded/known ahead of
+  // time the way the fixed-format "label: number" strings elsewhere are.
+  void emit_transient_message(int16_t x, int16_t y, const String& text, uint16_t color);
   // UI centering (Phase 4.1): measures a string's real pixel width at the
   // given font_size via Display::getTextBounds() -- the same real font
   // metrics emit_component_text() itself measures with, just callable

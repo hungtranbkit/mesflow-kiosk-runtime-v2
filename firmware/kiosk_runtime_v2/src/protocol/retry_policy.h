@@ -19,9 +19,22 @@ struct HttpOutcome {
 // `raw_status` is whatever the underlying HTTP client returned: a real HTTP
 // status code (100-599), or a library-specific negative "transport error"
 // code (e.g. ESP32 HTTPClient: -1 connection refused, -11 read timeout), or
-// this codebase's own -999 hard-deadline-exceeded marker (api_client.cpp).
+// one of this codebase's own negative markers: -999 hard-deadline-exceeded
+// (api_client.cpp), or kDnsFailMarker (below) for a pre-flight DNS
+// resolution failure detected BEFORE any HTTP attempt was even made.
 // `retry_after_header_s`: parsed Retry-After value if a 429 response
 // carried one, else -1.
+//
+// Simplified error taxonomy (2026-08-24, plain-HTTP migration -- see
+// docs/KIOSK_V2_PLAIN_HTTP.md): WIFI_DOWN / DNS_FAIL / TCP_CONNECT_FAIL /
+// HTTP_TIMEOUT / HTTP_4XX / HTTP_5XX / API_RATE_LIMITED /
+// PROTOCOL_INVALID_RESPONSE. No TLS-specific codes remain on this path --
+// WiFiClientSecure is no longer used by the active transport at all, so
+// there is nothing for a TLS-specific code to ever describe here.
+// WIFI_DOWN itself is generated directly by AsyncEventSender::send() (it
+// short-circuits before ever calling this function), not by this switch.
+constexpr int kDnsFailMarker = -1000;
+
 HttpOutcome classify_http_result(int raw_status, int retry_after_header_s = -1);
 
 // §22: exponential backoff + jitter. `attempt` is 1-based (first retry = 1).

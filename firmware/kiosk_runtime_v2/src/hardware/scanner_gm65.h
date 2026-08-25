@@ -23,6 +23,17 @@ class ScannerGm65 {
   // max-length.
   void poll();
 
+  // §7 of the 2026-08-25 finish-anti-stuck-recovery follow-up: re-runs
+  // init() (re-attaches the UART). Deliberately MANUAL only -- reachable
+  // via the DEV serial command 'reinit-scanner', NOT auto-triggered. A GM65
+  // over a one-way RX-only UART has no error signal at this layer (unlike
+  // the keypad's I2C NACK) -- prolonged silence is indistinguishable from
+  // "nobody scanned anything," which is also the normal idle state, so an
+  // automatic trigger here would risk exactly the "aggressive periodic
+  // reset" the task explicitly said not to add. Left as an honest gap, not
+  // a silent omission -- see the finish-anti-stuck-recovery report.
+  void reinit();
+
  private:
   static constexpr size_t kMaxLineLength = 128;
   static constexpr unsigned long kLineTimeoutMs = 200;

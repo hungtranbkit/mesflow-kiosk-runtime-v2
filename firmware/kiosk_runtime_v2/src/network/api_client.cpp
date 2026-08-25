@@ -22,15 +22,60 @@ namespace {
 // send (across retries) has no hard ceiling beyond max_attempts *
 // (RUNTIME_HTTP_TIMEOUT_MS + max backoff) -- acceptable now that this runs
 // on a background task the caller never blocks on (§23).
+//
+// Plain HTTP (2026-08-24, see docs/KIOSK_V2_PLAIN_HTTP.md): this used to
+// take an explicit persistent WiFiClientSecure to get TLS connection reuse
+// (Phase A latency task). That experiment is REMOVED, not just idle code --
+// it never actually achieved reuse in practice (a real library-level false
+// negative in this ESP32 core's WiFiClientSecure::connected(), confirmed by
+// reading the installed source), and the SRAM fragmentation investigation
+// separately confirmed the persistent client was not itself a measurable
+// contributor either way, since the WiFi driver's own ~47KB one-time init
+// already dominates. Removing HTTPS from the active path entirely (a
+// product decision: kiosk v2 business/event data is not confidential)
+// removes the whole mbedTLS memory question at once -- back to the
+// simplest possible shape HTTPClient itself supports: `http.begin(url)`
+// with a plain "http://" URL auto-selects a plain WiFiClient internally
+// (confirmed by reading HTTPClient::begin(String)/beginInternal() --
+// scheme "http" never touches WiFiClientSecure at all), fresh per attempt,
+// nothing held across calls.
+// Extracts the host portion of a "http://host[:port][/path]" URL. Plain
+// string scanning (no full URL-parser dependency, matching this project's
+// existing endpoint_utils.h convention).
+String extract_host(const String& url) {
+  int host_start = url.indexOf("://");
+  host_start = host_start < 0 ? 0 : host_start + 3;
+  int host_end = url.indexOf('/', host_start);
+  String host_and_port = host_end < 0 ? url.substring(host_start) : url.substring(host_start, host_end);
+  int colon = host_and_port.indexOf(':');
+  return colon < 0 ? host_and_port : host_and_port.substring(0, colon);
+}
+
 int perform_single_attempt(const String& url, const String& json_body, String* out_retry_after,
                            std::string* out_body) {
+  // Real, distinct DNS_FAIL classification (2026-08-24) -- a pre-flight
+  // WiFi.hostByName() check BEFORE ever attempting the TCP connect, so a
+  // DNS resolution failure is reported as DNS_FAIL rather than collapsing
+  // into the same TCP_CONNECT_FAIL bucket HTTPClient's own internal
+  // resolve-then-connect would otherwise produce (this exact ambiguity was
+  // a real diagnostic dead-end earlier in this project's history -- see
+  // the WiFi/network troubleshooting notes -- before it was traced to a
+  // completely different cause; this closes that ambiguity going forward
+  // instead of leaving it unresolved).
+  IPAddress resolved;
+  if (!WiFi.hostByName(extract_host(url).c_str(), resolved)) {
+    kiosk::health::log_structured("WARN", "API_ERR_DNS_FAIL", "api_client",
+                                   "WiFi.hostByName() failed -- no TCP attempt made");
+    return kiosk::protocol::kDnsFailMarker;
+  }
+
   HTTPClient http;
   http.setTimeout(RUNTIME_HTTP_TIMEOUT_MS);
   http.setConnectTimeout(RUNTIME_HTTP_TIMEOUT_MS);
   if (!http.begin(url)) {
     kiosk::health::log_structured("ERROR", "API_ERR_BEGIN_FAILED", "api_client",
                                    "HTTPClient::begin failed (bad URL?)");
-    return -1;  // treated as NET_CONNECT_REFUSED by classify_http_result
+    return -1;  // treated as TCP_CONNECT_FAIL by classify_http_result
   }
   http.addHeader("Content-Type", "application/json");
 
@@ -71,9 +116,9 @@ void send_task_entry(void* arg) {
     outcome = kiosk::protocol::classify_http_result(
         status, retry_after.present ? static_cast<int>(retry_after.seconds) : -1);
 
-    char log_msg[96];
-    snprintf(log_msg, sizeof(log_msg), "attempt=%d status=%d error_code=%s retryable=%d", attempt,
-             status, outcome.error_code.c_str(), outcome.retryable ? 1 : 0);
+    char log_msg[112];
+    snprintf(log_msg, sizeof(log_msg), "attempt=%d status=%d error_code=%s retryable=%d",
+             attempt, status, outcome.error_code.c_str(), outcome.retryable ? 1 : 0);
     kiosk::health::log_structured(outcome.ok ? "INFO" : "WARN", "EVENT_SEND_ATTEMPT", "api_client",
                                    log_msg);
 
@@ -127,7 +172,7 @@ bool AsyncEventSender::send(const String& url, const String& json_body, const st
     // tells it for free.
     SendOutcome result;
     result.outcome.ok = false;
-    result.outcome.error_code = "NET_WIFI_DOWN";
+    result.outcome.error_code = "WIFI_DOWN";
     result.outcome.retryable = true;
     result.event_id = event_id;
     result.device_seq = device_seq;
@@ -140,7 +185,27 @@ bool AsyncEventSender::send(const String& url, const String& json_body, const st
   }
 
   SendJob* job = new SendJob{this, url, json_body, event_id, device_seq};
-  BaseType_t created = xTaskCreate(send_task_entry, "event_send", 8192, job, 1, nullptr);
+  // 6144 (kept from the SRAM investigation's measured-safe value -- see
+  // that report for the real uxTaskGetStackHighWaterMark() data). A plain
+  // HTTP POST needs meaningfully less stack than a TLS handshake did, so
+  // this is if anything MORE conservative than necessary now, not tight.
+  BaseType_t created;
+#if MESFLOW_DEBUG_API
+  if (force_next_task_create_failure_) {
+    // §8 fault injection: behave EXACTLY like a genuine xTaskCreate()
+    // failure (same job cleanup, same log line, same false return) without
+    // actually needing real memory exhaustion to prove the retry/escalate
+    // recovery path in kiosk_runtime.cpp works.
+    force_next_task_create_failure_ = false;
+    kiosk::health::log_structured("WARN", "API_FAULT_INJECTED", "api_client",
+                                  "forced xTaskCreate failure (DEV test hook)");
+    created = pdFAIL;
+  } else {
+    created = xTaskCreate(send_task_entry, "event_send", 6144, job, 1, nullptr);
+  }
+#else
+  created = xTaskCreate(send_task_entry, "event_send", 6144, job, 1, nullptr);
+#endif
   if (created != pdPASS) {
     delete job;
     kiosk::health::log_structured("ERROR", "API_ERR_TASK_CREATE_FAILED", "api_client",

@@ -8,6 +8,7 @@
 #include <string>
 
 #include "../config/build_info.h"
+#include "../health/memory_diag.h"
 #include "../health/structured_log.h"
 #include "../protocol/json_extract.h"     // whitespace-tolerant field extraction
 #include "../protocol/protocol_codec.h"  // reuse json_escape
@@ -72,7 +73,25 @@ void DebugServer::begin() {
 }
 
 void DebugServer::poll() {
+  if (paused_) return;
   web_.handleClient();
+}
+
+void DebugServer::set_paused(bool paused) {
+  if (paused == paused_) return;
+  paused_ = paused;
+  if (paused_) {
+    // Actually release the socket (not just skip handleClient()) -- a
+    // client on the open AP shouldn't even be able to complete a TCP
+    // connection to this port while paused.
+    web_.close();
+    kiosk::health::log_structured("INFO", "DEBUG_API_PAUSED", "debug_server",
+                                   "setup AP is open (no password) -- debug HTTP API suspended for its duration");
+  } else {
+    web_.begin();
+    kiosk::health::log_structured("INFO", "DEBUG_API_RESUMED", "debug_server",
+                                   "setup AP closed -- debug HTTP API back up");
+  }
 }
 
 void DebugServer::handle_screenshot() {
@@ -116,6 +135,7 @@ void DebugServer::handle_screenshot() {
     web_.sendContent(screen_id.c_str(), screen_id_len);
   }
   web_.sendContent(reinterpret_cast<const char*>(display_.framebuffer()), pixel_bytes);
+  kiosk::health::log_memory_snapshot("AFTER_HTTP_DEBUG_REQUEST");
 }
 
 std::string DebugServer::build_ui_state_json() {
@@ -272,6 +292,7 @@ void DebugServer::write_screenshot_serial(Stream& out) {
   }
   out.write(fb_bytes, pixel_bytes);
   out.flush();
+  kiosk::health::log_memory_snapshot("AFTER_SERIAL_SCREENSHOT");
 }
 
 void DebugServer::write_ui_state_serial(Stream& out) {

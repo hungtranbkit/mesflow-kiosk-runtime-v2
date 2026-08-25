@@ -28,6 +28,12 @@ class WifiManager {
 
   WifiState state() const { return state_; }
 
+  // §4/§5 of the 2026-08-25 recovery-menu follow-up: "RETRY NETWORK" from
+  // the local recovery menu. A no-op unless currently DISCONNECTED and
+  // waiting out the retry cooldown -- CONNECTING/CONNECTED already have
+  // their own real attempt in progress/succeeded, nothing to force there.
+  void retry_now();
+
  private:
   kiosk::runtime::EventBus& bus_;
   WifiState state_ = WifiState::DISCONNECTED;

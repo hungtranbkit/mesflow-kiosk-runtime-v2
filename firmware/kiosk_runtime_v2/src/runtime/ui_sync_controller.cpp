@@ -1,5 +1,6 @@
 #include "ui_sync_controller.h"
 
+#include "../health/memory_diag.h"
 #include "../health/structured_log.h"
 #include "../network/endpoint_utils.h"
 #include "../protocol/json_extract.h"
@@ -70,6 +71,9 @@ bool UiSyncController::poll() {
                                 activated ? "UI_UPDATE_ACTIVATED" : "UI_ACTIVATE_FAILED",
                                 "ui_sync_controller",
                                 (std::string("version=") + std::to_string(pending_version_)).c_str());
+#if MESFLOW_DEBUG_API
+  kiosk::health::log_memory_snapshot("AFTER_UI_BUNDLE_SYNC");
+#endif
   return activated;
 }
 

@@ -207,7 +207,10 @@ verified live on real hardware this phase:
 - **No authoritative backend state.** Placeholder `READY_LOCAL` runtime
   state. Phase 2.
 - **No backend-controlled UI.** Screens are hardcoded. Phase 4.
-- **No Vietnamese glyph support at all** — stock ASCII-only font.
+- ~~No Vietnamese glyph support at all~~ -- fixed 2026-08-25, see
+  `docs/VIETNAMESE_FONT.md`: three native-size bitmap fonts (12/16/24px,
+  porting v1's proven strategy), full precomposed Vietnamese coverage,
+  verified on real hardware.
 - **Touch is not driven.**
 - **Keypad must be calibrated before any key resolves**, including the
   `*`-hold Wi-Fi recovery trigger — inherent to the hardware wiring.
@@ -219,6 +222,136 @@ verified live on real hardware this phase:
 - **No local recovery menu beyond Wi-Fi**: `SAFE_MODE`/`NO_NETWORK`/
   `DEVICE_RECOVERY`/`FATAL_ERROR`/`OTA_RECOVERY` are reserved names, not
   working screens.
+
+## Anti-Stuck Runtime Policy (Self-Recovery)
+
+**Invariant (2026-08-24): NO RECOVERABLE ERROR MAY LEAVE THE KIOSK
+PERMANENTLY STUCK.** Every transient/error state must have a timeout OR a
+progress condition, a next state, an automatic recovery path, and a
+structured error code — no dead-end state is allowed. This was written
+after a REAL incident: the durable event journal's in-memory index
+(`EventJournalIndex`) never shrank, grew to 211+ records / 96%+ of its
+256KB capacity over a day of testing, and the resulting internal-SRAM
+pressure made `xTaskCreate()` itself start failing — the device got stuck
+on "Lỗi gửi sự kiện - CHƯA được lưu" with no way off the screen short of a
+manual reboot.
+
+What's implemented:
+
+- **Journal compaction, now INCREMENTAL** (`EventJournalIndex::select_records_to_keep()` /
+  `rebuild_after_compaction()`, `EventJournal::begin_compaction()`/`compact_tick()`):
+  PENDING/IN_FLIGHT/CONFLICT/HUMAN_REVIEW records are always kept in full
+  (never silently drop an unsynced business event); ACKED/REJECTED are
+  bounded to the most-recently-created N of each (`CompactionPolicy`,
+  default 20/20). The routine 30s/70%-usage auto-trigger now writes
+  `kCompactionRecordsPerTick` (10) records per `loop()` iteration instead
+  of the whole rewrite in one blocking call — scanner/keypad/Wi-Fi polling
+  gets control back between chunks. `compaction_active`/
+  `compaction_records_processed`/`compaction_records_total`/
+  `compaction_last_progress_ms` are exposed in `/debug/device-state`. The
+  original one-shot `compact()` is kept for the rare CRITICAL low-memory /
+  task-creation-failure emergency paths, where finishing in one bounded
+  call is the safer tradeoff. Crash-safe atomic swap (temp file → validate
+  by re-scan → rename swap → cleanup) either way, with boot-time
+  orphan-file recovery in `EventJournal::init()` for every interruption
+  window — **all 4 windows verified on real hardware** via the DEV-only
+  `simulate-compaction-crash:<1-4>` hook (stray incomplete tmp, valid tmp
+  not yet swapped, mid-swap/.old-only, swap-done/.old-not-cleaned-up), each
+  recovering its full, un-truncated record count with zero loss. Compaction
+  itself was also verified live: a device at 214 records / internal-SRAM
+  largest-block 3828 bytes (CRITICAL) recovered to 94 records / 26612 bytes
+  on its first scheduled run, no reboot needed.
+- **Task-creation-failure recovery, PROVEN via fault injection**: a
+  `send()` failure (xTaskCreate failing, the actual root cause above) gets
+  exactly one retry after a bounded delay (triggering an immediate
+  compaction attempt first); a second consecutive failure escalates to a
+  controlled reboot (`RECOVERY_TASK_CREATE_FAILED`). DEV-only
+  `force-task-create-failure` (one-shot) makes this exercisable without
+  real memory exhaustion — **verified live twice**: a single forced
+  failure recovered via the retry (event sent, ACKED, state applied); two
+  forced failures in a row triggered a real `ESP.restart()`
+  (`reset_reason:"SW"`), and the device came back up cleanly with the
+  event still durably PENDING in the journal.
+- **Low-memory supervisor** (`src/health/low_memory_supervisor.h`):
+  classifies internal SRAM's largest contiguous free block as NORMAL/
+  WARNING/CRITICAL every 30s (PROD+DEV both). CRITICAL triggers an
+  immediate journal compaction; if that doesn't recover it, a controlled
+  reboot (`RECOVERY_LOW_MEMORY`).
+- **Error-view auto-timeout**: `draw_error_view()` takes over the whole
+  screen and previously was only dismissed by the next unrelated render
+  call — exactly the incident above. `KioskRuntime` now tracks how long an
+  error view has been showing and forces a return to the current
+  authoritative state after 20s if nothing else happened
+  (`RECOVERY_UI_STALL`) — presentation-only, never touches business state.
+- **Controlled reboot + reboot-loop protection + minimal SAFE_MODE, all
+  PROVEN on real hardware** (`src/health/recovery_supervisor.h`): every
+  automatic reboot logs a structured `RECOVERY_*` code, persists the
+  reason + a same-fault streak in NVS, and clears that streak once uptime
+  has been stable for a full periodic-check cycle (`recovery_supervisor_mark_stable()`).
+  A streak of 3 consecutive same-cause reboots sets `safe_mode`. DEV-only
+  `force-safe-mode` forces this without waiting for 3 genuine faults —
+  **verified live**: SAFE_MODE boot skips the debug HTTP server entirely
+  (still keeps display/input/Wi-Fi/bootstrap-resync/journal-recovery/the
+  recovery UI running) and renders a dedicated `safe_mode` screen
+  (confirmed via a real serial-captured screenshot) instead of any
+  business flow; the recovery menu and Wi-Fi setup gesture both work from
+  inside it; and — without even needing a further reboot — `is_safe_mode()`
+  flips back to `false` (screen returns to normal business rendering,
+  `screen_id` confirmed via screenshot) once 30s of stable uptime clears
+  the persisted streak. Only the debug HTTP server itself stays off until
+  an actual reboot, since that decision is made once at `setup()` time.
+- **Universal escape gesture + local recovery menu, PROVEN on real hardware**
+  (`WifiRecoveryController`): hold `*` ~5s opens a menu (RETRY NETWORK /
+  RESYNC / WIFI SETUP / RETURN / REBOOT, no unsafe "clear state" option);
+  keep holding to ~10s for the existing Wi-Fi setup portal instead. Works
+  from every screen, including SAFE_MODE, independent of business/
+  provisioning state. A digit key while the menu (or the portal) is open
+  is captured by the overlay, never falls through to business input
+  (`recovery_overlay_active()`) — verified live via `debug-input`,
+  including a REAL bug found and fixed in the process: selecting a menu
+  option didn't clear the `'*'`-held timer, so a still-held `'*'` could
+  silently trigger the Wi-Fi portal well after the menu interaction was
+  over; selecting any option now resets the hold timer, requiring a fresh
+  press-and-hold to reach Wi-Fi setup afterward.
+- **Lightweight UI stall detection**: reuses `Display::frame_id()` (bumped
+  once per render) as "render_generation" and `Renderer::current_screen_id()`
+  as "last_screen_id" — no render progress for 5 minutes forces one
+  redraw, then one display reinit, then a controlled reboot
+  (`RECOVERY_UI_STALL`) if neither helps. Honest limitation: a genuinely
+  hung `loop()` would also freeze this check, since it runs on the same
+  task — this catches "nothing left to trigger a redraw", not a dead loop.
+- **Keypad self-healing (real signal, real threshold)**: `scan_pair()`'s
+  existing I2C-error return value now feeds a counter; 50 consecutive
+  errors re-initializes the I2C bus (`RECOVERY_KEYPAD_REINIT`) without a
+  full re-discovery/recalibration. **Scanner intentionally does NOT get an
+  automatic reinit** — a one-way RX UART has no error signal distinct from
+  normal idle silence, so an automatic trigger would risk exactly the
+  "aggressive periodic reset" this task said not to add; a manual
+  `reinit-scanner` DEV command exists instead.
+- **Structured recovery codes + bounded history**: `RecoveryCode`
+  (LOW_MEMORY/JOURNAL_PRESSURE/TASK_CREATE_FAILED/NETWORK_TIMEOUT/
+  STATE_DESYNC/UI_STALL/WATCHDOG/REBOOT_LOOP/SCANNER_REINIT/KEYPAD_REINIT)
+  and the last 8 recovery events (code/detail/uptime/journal
+  pressure/memory) are exposed in `/debug/device-state`'s `recovery{}`
+  block for every profile, not just DEV.
+
+Known gaps in this pass (honestly deferred, not silently skipped):
+
+- **Compaction's final validate+swap+rebuild step is still one synchronous
+  call** (fast — reads/renames, not per-record flash writes — but not
+  chunked). Only the dominant per-record encode+write cost was made
+  incremental.
+- **UI stall detection can't catch a truly hung main loop** (see above) —
+  only a "nothing renders, but loop() is still running" class of stall.
+- **No independent display-init retry redundancy beyond the one reinit
+  attempt** UI stall recovery already does, and no input-stall detection
+  beyond the keypad I2C-error counter (the scanner has none, by design —
+  see above).
+- **Fault-injection test matrix**: only the targeted scenarios that map to
+  real, previously-observed failure modes were built and exercised
+  (compaction crash windows, task-create failure/escalation, SAFE_MODE
+  entry/exit) — a full generic A-J synthetic fault-injection suite beyond
+  those was not built.
 
 ## Next phase
 

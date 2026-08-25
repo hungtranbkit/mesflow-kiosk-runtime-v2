@@ -36,6 +36,13 @@
 // and backs off.
 #define WIFI_CONNECT_TIMEOUT_MS 15000
 
+// Universal escape gesture (2026-08-25 finish-anti-stuck-recovery
+// follow-up, §5/§7): hold '*' ~5s -> local recovery menu; keep holding to
+// ~10s -> Wi-Fi setup portal (unchanged threshold/behavior from before).
+// Works from every screen (WifiRecoveryController is independent of
+// whatever KioskRuntime is currently rendering) -- never mutates business
+// state on its own.
+#define RECOVERY_MENU_HOLD_MS 5000
 // Local Wi-Fi recovery: hold '*' this long to enter the AP+portal recovery
 // flow (docs/WIFI_RECOVERY.md, §16 of the task spec).
 #define WIFI_RECOVERY_HOLD_MS 10000
@@ -43,8 +50,12 @@
 // before declaring it failed and rolling back to the previous credentials.
 #define WIFI_RECOVERY_TEST_TIMEOUT_MS 15000
 // Portal auto-exits after this long with no HTTP request (§23: recovery
-// mode must not stay open forever).
-#define WIFI_RECOVERY_PORTAL_TIMEOUT_MS 600000
+// mode must not stay open forever). 12 minutes -- inside the 2026-08-24
+// open-AP rework's requested "approximately 10-15 minutes" window, with a
+// little more real-world margin than the previous flat 10 minutes now that
+// the AP itself is open (an operator fumbling with their phone's Wi-Fi
+// settings shouldn't get timed out mid-setup).
+#define WIFI_RECOVERY_PORTAL_TIMEOUT_MS 720000
 
 // Remote Visual Debug subsystem (docs/VISUAL_DEBUG.md). DEV profile only
 // (§14/§30/§70) -- derived from the build profile now, not a standalone
@@ -74,13 +85,17 @@
 // `api-endpoint:<url>` (see kiosk_runtime_v2.ino), and callers must treat
 // "" as CONFIG_BACKEND_NOT_SET, not attempt a request against it.
 
-// Backend URL scheme policy (§41). DEV allows http/https for bring-up
-// against a local mock; PROD requires https only.
-#if MESFLOW_PROFILE_PROD
-#define BACKEND_URL_ALLOW_HTTP 0
-#else
+// Backend URL scheme policy (§41, revised 2026-08-24 -- see
+// docs/KIOSK_V2_PLAIN_HTTP.md). Kiosk v2 business/event data is not
+// confidential (explicit product decision); the canonical transport is now
+// plain HTTP for BOTH profiles, not a DEV-only bring-up convenience --
+// mbedTLS's internal-SRAM requirement was found to sit right at this
+// chip's real contiguous-memory ceiling (see the SRAM fragmentation
+// investigation), making HTTPS an active reliability liability for a
+// non-confidential payload. Still validated either way (never accepts a
+// malformed URL); this only decides which SCHEME is accepted, not whether
+// validation happens at all.
 #define BACKEND_URL_ALLOW_HTTP 1
-#endif
 #define BACKEND_URL_MAX_LENGTH 160
 
 // --- Retry policy (docs/RETRY_POLICY.md, §22) ---

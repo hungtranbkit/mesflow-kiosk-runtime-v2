@@ -11,6 +11,7 @@
 #include "../protocol/state_projection.h"
 #include "../security/device_identity.h"
 #include "../storage/config_store.h"
+#include "../storage/event_journal.h"
 #include "../storage/ui_bundle_store.h"
 #include "../ui/renderer.h"
 #include "event_bus.h"
@@ -52,13 +53,14 @@ class KioskRuntime {
  public:
   KioskRuntime(EventBus& bus, kiosk::ui::Renderer& renderer, kiosk::storage::ConfigStore& config,
                kiosk::security::DeviceIdentity& identity, kiosk::network::TimeSync& time_sync,
-               kiosk::storage::UiBundleStore& ui_bundle_store)
+               kiosk::storage::UiBundleStore& ui_bundle_store, kiosk::storage::EventJournal& journal)
       : bus_(bus),
         renderer_(renderer),
         config_(config),
         identity_(identity),
         time_sync_(time_sync),
-        ui_bundle_store_(ui_bundle_store) {}
+        ui_bundle_store_(ui_bundle_store),
+        journal_(journal) {}
 
   // `boot_id` is generated once in the .ino entry point and shared with
   // boot_diagnostics, so the diagnostics screen and every protocol event
@@ -114,6 +116,33 @@ class KioskRuntime {
   int64_t last_server_seq() const { return last_server_seq_; }
   String local_quantity_buffer() const { return local_qty_buffer_.c_str(); }
 
+  // Phase 3A durable journal (shadow mode) -- read-only access for
+  // /debug/device-state and the heartbeat body (status_snapshot.cpp).
+  const kiosk::storage::EventJournal& journal() const { return journal_; }
+
+  // --- Self-recovery (2026-08-25 finish-anti-stuck-recovery follow-up) ---
+  // Public forwarding methods so WifiRecoveryController's recovery menu
+  // (§4) can trigger these WITHOUT KioskRuntime depending on
+  // WifiRecoveryController the other way -- the menu itself lives entirely
+  // in WifiRecoveryController, this just gives it the two actions that
+  // only KioskRuntime knows how to do.
+  //
+  // "2 RESYNC": same start_resync() every STATE_CONFLICT/version-regression
+  // path already uses -- a no-op if identity isn't ACTIVE yet (nothing
+  // meaningful to resync against) or a fetch is already in flight
+  // (start_resync() itself handles that quietly).
+  void request_manual_resync();
+  // "4 RETURN": re-render whatever the CURRENT authoritative state actually
+  // is -- reuses refresh_idle_screen() as-is (already public), named here
+  // only in this comment for discoverability from the menu's call site.
+
+#if MESFLOW_DEBUG_API
+  // DEV-only fault injection forwarding (§8) -- AsyncEventSender's hook is
+  // private to KioskRuntime (sender_), so expose a narrow pass-through for
+  // the serial test command.
+  void force_next_task_create_failure_for_test() { sender_.force_next_task_create_failure(); }
+#endif
+
  private:
   EventBus& bus_;
   kiosk::ui::Renderer& renderer_;
@@ -121,6 +150,7 @@ class KioskRuntime {
   kiosk::security::DeviceIdentity& identity_;
   kiosk::network::TimeSync& time_sync_;
   kiosk::storage::UiBundleStore& ui_bundle_store_;
+  kiosk::storage::EventJournal& journal_;
   kiosk::network::AsyncEventSender sender_;
   kiosk::network::AsyncStateFetcher state_fetcher_;
   kiosk::protocol::StateProjection state_projection_;
@@ -157,6 +187,36 @@ class KioskRuntime {
   QtyStep qty_step_ = QtyStep::GOOD;
   int32_t qty_good_ = 0;
   int32_t qty_defect_ = 0;
+
+  // --- Self-recovery (2026-08-24) ---
+  // §6/§15 of the task: draw_error_view() takes over the whole screen and
+  // is otherwise only dismissed by the NEXT render call -- if nothing ever
+  // triggers one (no scan, no key, no state change), the operator is stuck
+  // looking at it forever. This is exactly the incident that motivated the
+  // task ("Lỗi gửi sự kiện - CHƯA được lưu" with no way off the screen).
+  // Tracked here, not in Renderer, since only KioskRuntime knows what a
+  // safe "next" render actually is.
+  bool showing_error_view_ = false;
+  unsigned long error_view_shown_at_ms_ = 0;
+  static constexpr unsigned long kErrorViewTimeoutMs = 20000;
+
+  // §10: a task-creation failure (API_ERR_TASK_CREATE_FAILED, the real root
+  // cause behind the incident above) gets exactly ONE retry after a bounded
+  // delay -- not an immediate retry (the memory pressure that caused it
+  // needs a moment, plus a chance for the periodic compaction check to
+  // run), and never a silent infinite retry loop. A SECOND consecutive
+  // failure for the SAME event is treated as application-level-exhausted
+  // and escalates to a controlled reboot (§12) rather than leaving the
+  // operator stuck.
+  bool send_retry_pending_ = false;
+  unsigned long send_retry_at_ms_ = 0;
+  std::string retry_json_body_;
+  std::string retry_event_id_;
+  uint64_t retry_device_seq_ = 0;
+  static constexpr unsigned long kSendRetryDelayMs = 800;
+
+  void check_error_view_timeout();
+  void check_send_retry();
 
   void handle_scan(const String& raw_code, unsigned long timestamp_ms);
   void handle_business_key(char key);

@@ -4,6 +4,7 @@
 
 #include <string>
 
+#include "../config/runtime_config.h"  // MESFLOW_DEBUG_API
 #include "../protocol/retry_policy.h"
 
 namespace kiosk::network {
@@ -58,6 +59,15 @@ class AsyncEventSender {
 
   bool busy() const;
 
+#if MESFLOW_DEBUG_API
+  // DEV-only fault injection (2026-08-25, §8 of the finish-anti-stuck-
+  // recovery follow-up): makes the NEXT send() call skip xTaskCreate()
+  // entirely and fail exactly the way a genuine API_ERR_TASK_CREATE_FAILED
+  // does, without needing to actually exhaust real memory to prove the
+  // recovery path works. One-shot -- cleared as soon as it's consumed.
+  void force_next_task_create_failure() { force_next_task_create_failure_ = true; }
+#endif
+
   // Call every loop() iteration. Returns true (and fills `out`) exactly
   // once per completed send. Never blocks.
   bool poll(SendOutcome& out);
@@ -74,6 +84,9 @@ class AsyncEventSender {
   bool busy_ = false;
   bool result_ready_ = false;
   SendOutcome pending_result_;
+#if MESFLOW_DEBUG_API
+  bool force_next_task_create_failure_ = false;
+#endif
 };
 
 }  // namespace kiosk::network

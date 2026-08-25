@@ -47,7 +47,6 @@ class Display : public Adafruit_ILI9341 {
   bool init();
 
   void clear(uint16_t color);
-  void draw_line(int line_index, const char* text, uint16_t color);
 
   // --- Visual debug subsystem (docs/VISUAL_DEBUG.md) ---
 

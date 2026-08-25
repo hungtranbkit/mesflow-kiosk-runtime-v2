@@ -27,3 +27,7 @@ tools/artifacts/
 # real fixtures/source and stay tracked.
 artifacts/e2e/[0-9]*/
 artifacts/e2e/QA-*/
+# Same reasoning: timestamped kiosk_test_runner.py output, generated per
+# run, not source (2026-08-25 stabilization pass -- found untracked,
+# excluded rather than committed 152KB of generated JSON).
+artifacts/test-runs/

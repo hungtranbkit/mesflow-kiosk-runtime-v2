@@ -3,7 +3,7 @@
 // Own version line, independent of the legacy kiosk firmware's numbering.
 // Keep in sync with the top-level VERSION file. (No automated build-time
 // read of VERSION into this macro yet -- Phase 1 scope; bump both by hand.)
-#define KIOSK_RUNTIME_VERSION "0.3.0"
+#define KIOSK_RUNTIME_VERSION "0.9.0"
 
 // Filled at build time via arduino-cli --build-property; falls back to a
 // visible placeholder if not injected, so a manual IDE build still shows

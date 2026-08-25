@@ -51,7 +51,7 @@ EMPLOYEES = {
 OPERATIONS = {
     "OP-001": {"name": "Chan", "open": True},
     "OP-002": {"name": "Han", "open": True},
-    "OP-CLOSED": {"name": "Da dong", "open": False},
+    "OP-CLOSED": {"name": "Đã đóng", "open": False},
     # 111-THAN-THUNG-R-05: the real card's actual operation QR code, seen
     # live during the 2026-08-24 physical scan regression test (correctly
     # rejected as OPERATION_NOT_FOUND before this was added -- proof the
@@ -140,29 +140,29 @@ UI_BUNDLE_CONTENT = {
         "screens": [
             {"id": "state_wait_employee", "components": [
                 _text(4, "MESFlow Kiosk Runtime v2", "#00FF00"),
-                _text(40, "San sang quet the nhan vien"),
+                _text(40, "Sẵn sàng quét thẻ nhân viên"),
             ]},
             {"id": "state_wait_operation", "components": [
                 _text(4, "{{employee_name}}", "#00FF00"),
-                _text(40, "Quet ma cong doan"),
+                _text(40, "Quét mã công đoạn"),
             ]},
             {"id": "state_session_active", "components": [
                 _text(4, "{{employee_name}}", "#00FF00"),
                 _text(22, "{{operation_name}}"),
-                _text(58, "Muc tieu: {{target_qty}}"),
-                _text(94, "Bam # de ket thuc"),
+                _text(58, "Mục tiêu: {{target_qty}}"),
+                _text(94, "Bấm # để kết thúc"),
             ]},
             {"id": "state_quantity_input", "components": [
                 _text(4, "{{operation_name}}", "#00FF00"),
-                _text(40, "Nhap so luong dat, # de gui:"),
+                _text(40, "Nhập số lượng đạt, # để gửi:"),
                 _text(76, "{{local_digit_buffer}}", "#00FF00"),
             ]},
             {"id": "state_device_disabled", "components": [
-                _text(4, "THIET BI DA BI VO HIEU HOA", "#FFFF00"),
-                _text(40, "Lien he quan tri vien"),
+                _text(4, "THIẾT BỊ ĐÃ BỊ VÔ HIỆU HÓA", "#FFFF00"),
+                _text(40, "Liên hệ quản trị viên"),
             ]},
             {"id": "state_maintenance", "components": [
-                _text(4, "THIET BI DANG BAO TRI", "#FFFF00"),
+                _text(4, "THIẾT BỊ ĐANG BẢO TRÌ", "#FFFF00"),
             ]},
         ],
     },
@@ -206,14 +206,14 @@ UI_BUNDLE_CONTENT[3] = {
         # drawReady()
         {"id": "state_wait_employee", "components": [
             _row(0, "MESFlow Kiosk v2", V1_MUTED),
-            _row(2, "QUET THE NHAN VIEN", V1_WHITE),
-            _row(4, "Dua ma vao may quet", V1_MUTED),
+            _row(2, "QUÉT THẺ NHÂN VIÊN", V1_WHITE),
+            _row(4, "Đưa mã vào máy quét", V1_MUTED),
         ]},
         # drawWorker() -- "employee scanned, now scan operation"
         {"id": "state_wait_operation", "components": [
             _row(0, "{{employee_name}}", V1_OK),
-            _row(2, "QUET CONG DOAN", V1_WHITE),
-            _row(9, "* HUY", V1_MUTED),
+            _row(2, "QUÉT CÔNG ĐOẠN", V1_WHITE),
+            _row(9, "* HỦY", V1_MUTED),
         ]},
         # drawStartSuccess() -- legacy's intermediate drawOperation()
         # "scanned, confirm start" step has no equivalent v2 BusinessState
@@ -223,9 +223,9 @@ UI_BUNDLE_CONTENT[3] = {
             _row(0, "{{employee_name}}", V1_OK),
             _row(1, "{{operation_name}}", V1_WHITE),
             _hline(38),
-            _row(2, "Muc tieu: {{target_qty}}", V1_MUTED),
-            _row(3, "Da lam: {{produced_qty}}", V1_MUTED),
-            _row(9, "* HUY   # KET THUC", V1_WHITE),
+            _row(2, "Mục tiêu: {{target_qty}}", V1_MUTED),
+            _row(3, "Đã làm: {{produced_qty}}", V1_MUTED),
+            _row(9, "* HỦY   # KẾT THÚC", V1_WHITE),
         ]},
         # drawQtyInput() -- legacy's FONT_QUANTITY=8 giant digits have no
         # equivalent (TEXT component font_size is not yet honored by the
@@ -233,24 +233,24 @@ UI_BUNDLE_CONTENT[3] = {
         # visual gap of the whole parity pass).
         {"id": "state_quantity_input", "components": [
             _row(0, "{{operation_name}}", V1_OK),
-            _row(2, "Nhap so luong, # de gui:", V1_WHITE),
+            _row(2, "Nhập số lượng đạt, # để gửi:", V1_WHITE),
             _row(4, "{{local_digit_buffer}}", V1_WHITE),
-            _row(9, "* XOA   # TIEP", V1_WHITE),
+            _row(9, "* XÓA   # TIẾP", V1_WHITE),
         ]},
         # No direct legacy equivalent (esp-kiosk has no device-suspension
         # concept) -- styled consistent with legacy's C_ERR-for-critical
         # convention rather than invented from scratch.
         {"id": "state_device_disabled", "components": [
-            _row(0, "THIET BI DA BI VO HIEU HOA", V1_ERR),
-            _row(2, "Lien he quan tri vien", V1_MUTED),
+            _row(0, "THIẾT BỊ ĐÃ BỊ VÔ HIỆU HÓA", V1_ERR),
+            _row(2, "Liên hệ quản trị viên", V1_MUTED),
         ]},
         # Simplified vs. legacy's drawMaintenanceScreen() (SSID/IP/pending-
         # sync/last-sync panel): that data comes from the Phase 3 offline
         # queue, which v2 doesn't have yet (out of scope this task) --
         # KNOWN DIFFERENCE, documented, not a redesign of either system.
         {"id": "state_maintenance", "components": [
-            _row(0, "THIET BI DANG BAO TRI", V1_WARN),
-            _row(2, "Lien he ky thuat", V1_MUTED),
+            _row(0, "THIẾT BỊ ĐANG BẢO TRÌ", V1_WARN),
+            _row(2, "Liên hệ kỹ thuật", V1_MUTED),
         ]},
     ],
 }
@@ -335,9 +335,9 @@ def apply_event(dev, event_type, payload, quantity_good):
     Mutates `dev` in place ONLY when a real transition happens (§15: no
     version bump on rejections that don't change state)."""
     if dev["disabled"]:
-        return False, "DEVICE_DISABLED", "Thiet bi da bi vo hieu hoa"
+        return False, "DEVICE_DISABLED", "Thiết bị đã bị vô hiệu hóa"
     if dev["maintenance"]:
-        return False, "MAINTENANCE", "Thiet bi dang bao tri"
+        return False, "MAINTENANCE", "Thiết bị đang bảo trì"
 
     state = dev["state_name"]
 
@@ -346,7 +346,7 @@ def apply_event(dev, event_type, payload, quantity_good):
 
         if state == "WAIT_EMPLOYEE":
             if kind != "EMP":
-                return False, "STATE_INVALID_TRANSITION", "Can quet the nhan vien"
+                return False, "STATE_INVALID_TRANSITION", "Cần quét thẻ nhân viên"
             emp = EMPLOYEES.get(value)
             if emp is None and value.startswith("NV") and value[2:].isdigit():
                 # DEV convenience for the 2026-08-24 real-scanner regression
@@ -359,9 +359,9 @@ def apply_event(dev, event_type, payload, quantity_good):
                 emp = {"name": f"Real Card {value}", "active": True}
                 EMPLOYEES[value] = emp
             if emp is None:
-                return False, "EMPLOYEE_NOT_FOUND", "Nhan vien khong hop le"
+                return False, "EMPLOYEE_NOT_FOUND", "Nhân viên không hợp lệ"
             if not emp["active"]:
-                return False, "EMPLOYEE_DISABLED", "Nhan vien da bi khoa"
+                return False, "EMPLOYEE_DISABLED", "Nhân viên đã bị khóa"
             dev["session"] = {
                 "employee_id": value, "employee_name": emp["name"],
                 "operation_code": None, "operation_name": None,
@@ -374,7 +374,7 @@ def apply_event(dev, event_type, payload, quantity_good):
 
         if state == "WAIT_OPERATION":
             if kind != "OP":
-                return False, "STATE_INVALID_TRANSITION", "Can quet ma cong doan"
+                return False, "STATE_INVALID_TRANSITION", "Cần quét mã công đoạn"
             op = OPERATIONS.get(value)
             if op is None and value:
                 # Same DEV convenience as the NV### employee wildcard above:
@@ -388,9 +388,9 @@ def apply_event(dev, event_type, payload, quantity_good):
                 op = {"name": value, "open": True}
                 OPERATIONS[value] = op
             if op is None:
-                return False, "OPERATION_NOT_FOUND", "Cong doan khong hop le"
+                return False, "OPERATION_NOT_FOUND", "Công đoạn không hợp lệ"
             if not op["open"]:
-                return False, "OPERATION_CLOSED", "Cong doan da dong"
+                return False, "OPERATION_CLOSED", "Công đoạn đã đóng"
             dev["session"]["operation_code"] = value
             dev["session"]["operation_name"] = op["name"]
             dev["session"]["session_id"] = f"S-{server_seq_counter:05d}"
@@ -400,20 +400,20 @@ def apply_event(dev, event_type, payload, quantity_good):
             bump_version(dev)
             return True, None, None
 
-        return False, "STATE_INVALID_TRANSITION", "Khong the quet ma o trang thai nay"
+        return False, "STATE_INVALID_TRANSITION", "Không thể quét mã ở trạng thái này"
 
     if event_type == "FINISH_REQUESTED":
         if state != "SESSION_ACTIVE":
-            return False, "STATE_INVALID_TRANSITION", "Khong co phien dang hoat dong"
+            return False, "STATE_INVALID_TRANSITION", "Không có phiên đang hoạt động"
         dev["state_name"] = "QUANTITY_INPUT"
         bump_version(dev)
         return True, None, None
 
     if event_type == "QUANTITY_SUBMITTED":
         if state != "QUANTITY_INPUT":
-            return False, "STATE_INVALID_TRANSITION", "Chua yeu cau ket thuc"
+            return False, "STATE_INVALID_TRANSITION", "Chưa yêu cầu kết thúc"
         if quantity_good is None:
-            return False, "QUANTITY_INVALID", "Thieu so luong"
+            return False, "QUANTITY_INVALID", "Thiếu số lượng"
         dev["session"] = None
         dev["state_name"] = "WAIT_EMPLOYEE"
         bump_version(dev)
@@ -421,7 +421,7 @@ def apply_event(dev, event_type, payload, quantity_good):
 
     if event_type == "CANCEL_REQUESTED":
         if state == "WAIT_EMPLOYEE":
-            return False, "STATE_INVALID_TRANSITION", "Khong co gi de huy"
+            return False, "STATE_INVALID_TRANSITION", "Không có gì để hủy"
         dev["session"] = None
         dev["state_name"] = "WAIT_EMPLOYEE"
         bump_version(dev)

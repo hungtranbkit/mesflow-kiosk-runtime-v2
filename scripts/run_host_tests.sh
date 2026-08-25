@@ -43,6 +43,22 @@ for test_src in test/host/test_*.cpp; do
                   firmware/kiosk_runtime_v2/src/protocol/ui_bundle.cpp)
       ;;
     test_sequence_reservation) ;;  # header-only
+    test_ap_ssid)
+      extra_srcs=(firmware/kiosk_runtime_v2/src/protocol/ap_ssid.cpp)
+      ;;
+    test_vn_font_core)
+      extra_srcs=(firmware/kiosk_runtime_v2/src/protocol/vn_font_core.cpp)
+      ;;
+    test_event_journal)
+      extra_srcs=(firmware/kiosk_runtime_v2/src/protocol/json_extract.cpp
+                  firmware/kiosk_runtime_v2/src/protocol/protocol_codec.cpp
+                  firmware/kiosk_runtime_v2/src/protocol/journal_record.cpp
+                  firmware/kiosk_runtime_v2/src/protocol/event_journal_core.cpp
+                  firmware/kiosk_runtime_v2/src/protocol/event_journal_index.cpp)
+      ;;
+    test_low_memory_supervisor)
+      extra_srcs=(firmware/kiosk_runtime_v2/src/health/low_memory_supervisor.cpp)
+      ;;
   esac
 
   echo "--- $name ---"

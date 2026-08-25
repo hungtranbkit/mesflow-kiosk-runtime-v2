@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "../config/hardware_pins.h"
+#include "../health/recovery_supervisor.h"
 #include "../health/structured_log.h"
 
 namespace kiosk::hardware {
@@ -145,6 +146,18 @@ bool KeypadPcf8574::init() {
   return true;
 }
 
+// §7 of the 2026-08-25 follow-up: re-establish the I2C bus (same call
+// init() itself makes) after sustained communication failure. Deliberately
+// NOT a full re-init -- found_/calibrated_/pairs_ are untouched, since a
+// real address-search + calibration reload is unnecessary and riskier
+// (e.g. would wrongly report HW_KEYPAD_NOT_FOUND on a transient bus issue
+// that Wire.begin() alone recovers from) for what's usually just the ESP32
+// I2C driver needing to be kicked, not the physical mapping changing.
+void KeypadPcf8574::reinit_bus() {
+  Wire.begin(PIN_KEYPAD_SDA, PIN_KEYPAD_SCL, 100000);
+  release_all();
+}
+
 void KeypadPcf8574::poll() {
   if (!found_) return;
 
@@ -156,8 +169,17 @@ void KeypadPcf8574::poll() {
   if (pair == -3) {
     kiosk::health::log_structured("WARN", "HW_KEYPAD_I2C_ERROR", "keypad_pcf8574",
                                    "I2C communication error during scan");
+    if (++consecutive_i2c_errors_ >= kI2cErrorReinitThreshold) {
+      consecutive_i2c_errors_ = 0;
+      kiosk::health::record_recovery_event(kiosk::health::RecoveryCode::KEYPAD_REINIT,
+                                           "sustained I2C errors -- re-initialized the bus",
+                                           /*journal_pressure=*/0, /*memory_free_bytes=*/0,
+                                           /*memory_largest_block_bytes=*/0);
+      reinit_bus();
+    }
     return;
   }
+  consecutive_i2c_errors_ = 0;
 
   if (pair != candidate_pair_) {
     candidate_pair_ = pair;
