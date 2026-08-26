@@ -105,6 +105,14 @@ BootstrapResult BootstrapClient::attempt(const String& events_url, const String&
   if (!accepted || (accepted_version != 0 && accepted_version != 1)) {
     result.status = BootstrapStatus::REJECTED;
     result.accepted_protocol_version = static_cast<uint32_t>(accepted_version);
+    // §11 of the 2026-08-26 physical field test: a device-disabled
+    // rejection (app/mesflow/web/kiosk_v2.py's real HTTP 403, body shape
+    // {"error":"FORBIDDEN","message":"...","ok":false}) has a top-level
+    // "message" string -- not nested under "error" the way /events'
+    // business-rejection shape is. "" if absent (an older backend, or the
+    // OTHER rejection cause with no message field -- unsupported
+    // protocol_version).
+    result.reject_message = kiosk::protocol::json_extract_string(response, "message").c_str();
     kiosk::health::log_structured("WARN", "BOOTSTRAP_REJECTED", "bootstrap_client",
                                    accepted ? "unsupported protocol_version" : "accepted:false");
     last_result_ = result;

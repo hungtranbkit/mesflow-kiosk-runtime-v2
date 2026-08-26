@@ -48,6 +48,16 @@ struct BootstrapResult {
   String server_environment;  // raw settings.environment, e.g. "test"/"production"/"local_test"
   String server_role;         // raw settings.server_role, e.g. "DEV"/"PRODUCTION_TEST"/"PRODUCTION"/""
   String server_version;      // mesflow.__version__, e.g. "71.0.0.70"
+
+  // 2026-08-26 physical field test, §11: real gap found live -- a REJECTED
+  // bootstrap (e.g. a DISABLED/SUSPENDED kiosk identity, now correctly
+  // rejected server-side with a real 403 + human message after the
+  // matching app/mesflow/web/kiosk_v2.py fix) had NO message to show at
+  // all; the device just silently stayed on the waiting screen forever.
+  // "" if the response carried no message/error field to show (an older
+  // backend, or the OTHER rejection cause -- unsupported protocol_version
+  // -- which has no message field either).
+  String reject_message;
 };
 
 // Single attempt, blocking (this runs once at boot, before normal scan

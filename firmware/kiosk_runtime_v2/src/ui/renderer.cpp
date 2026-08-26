@@ -967,6 +967,22 @@ void Renderer::draw_from_bundle(const kiosk::protocol::UiScreen& screen,
   if (transient_message.length() > 0) {
     emit_line(6, transient_message, is_error ? kColorWarn : kColorFg);
   }
+  // §7/§12 (2026-08-26 UX-hardening pass): REAL bug found live on the test
+  // board -- this device has an active server-authored UI bundle
+  // (bundle schema has no footer/hint component type at all, confirmed by
+  // reading the actual bundle content in kiosk_v2_ui_bundles), which wins
+  // over draw_business_state()'s hardcoded WAIT_OPERATION screen per the
+  // documented bundle-first precedence above in render_current_business_
+  // state() -- so the '#'=Cancel footer hint added there was silently
+  // invisible on every real device running a bundle that predates this
+  // safety feature (i.e. every bundle that exists today). A safety
+  // affordance a legacy bundle can't possibly know to include must not
+  // depend on that bundle being updated first -- layered on top here,
+  // never overwriting anything the bundle itself defines (bundles have no
+  // footer concept to conflict with).
+  if (screen.screen_id == "state_wait_operation") {
+    draw_footer("", "# Hủy");
+  }
   draw_status_bar(wifi);
   end_screen();
 }

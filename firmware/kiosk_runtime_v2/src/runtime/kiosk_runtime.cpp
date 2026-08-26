@@ -116,6 +116,27 @@ bool KioskRuntime::apply_server_environment(const kiosk::network::BootstrapResul
 }
 
 void KioskRuntime::on_bootstrap_result(const kiosk::network::BootstrapResult& result) {
+  // §11 of the 2026-08-26 physical field test: real gap found live -- a
+  // REJECTED bootstrap (a DISABLED/SUSPENDED kiosk identity, now correctly
+  // rejected server-side with a real 403 after the matching
+  // app/mesflow/web/kiosk_v2.py fix) previously fell straight through this
+  // early return with NO message shown at all -- the device just silently
+  // sat on the pre-bootstrap waiting screen forever, giving an operator no
+  // way to tell "disabled" apart from "still connecting". Shown directly
+  // via draw_error_view() (not render_current_business_state(), which
+  // gates everything else behind has_snapshot()/identity checks that don't
+  // apply here -- there IS no snapshot to fall back to, by definition, for
+  // the very first bootstrap this boot) -- same visual treatment as any
+  // other business rejection, generic fallback text if the server didn't
+  // send a message (an older backend, or the other rejection cause with no
+  // message field).
+  if (result.status == kiosk::network::BootstrapStatus::REJECTED) {
+    String msg = result.reject_message.length() > 0 ? result.reject_message
+                                                     : String("Thiết bị bị từ chối bởi server");
+    kiosk::health::log_structured("WARN", "BOOTSTRAP_REJECTED_SHOWN", "kiosk_runtime", msg.c_str());
+    renderer_.draw_error_view(msg, /*is_network_error=*/false, wifi_indicator_);
+    return;
+  }
   if (result.status != kiosk::network::BootstrapStatus::OK) return;
 
   if (!apply_server_environment(result)) return;  // §3: mismatch -- never apply a snapshot, never proceed
@@ -921,7 +942,19 @@ void KioskRuntime::check_ui_timeout() {
       qty_timeout_warned_ = true;
       kiosk::health::log_structured("INFO", "UI_TIMEOUT_WARN", "kiosk_runtime",
                                      "QUANTITY_INPUT idle timeout -- warning operator, session stays open");
-      render_current_business_state("Vui lòng nhập số lượng", true, false);
+      // Real usability bug found live on the test board (physical field
+      // test, 2026-08-26): passing is_error=true here routed through
+      // render_current_business_state()'s full-screen draw_error_view()
+      // takeover -- a red "LỖI" (ERROR) banner for what is actually a
+      // benign "please continue" reminder, AND it replaced the quantity
+      // screen entirely, so the operator's already-in-progress digit entry
+      // context visually vanished (even though nothing was actually lost
+      // server-side -- state_projection_ never changed). is_error=false
+      // instead falls through to the normal QUANTITY_INPUT rendering
+      // path, which shows this same message INLINE alongside the digit
+      // buffer the operator was already looking at -- correct severity,
+      // no lost context.
+      render_current_business_state("Vui lòng nhập số lượng", false, false);
     } else {
       kiosk::health::log_structured("INFO", "UI_TIMEOUT_STAY", "kiosk_runtime",
                                      "QUANTITY_INPUT idle timeout again -- staying (real session open, no safe reset)");
