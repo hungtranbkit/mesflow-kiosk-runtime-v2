@@ -124,6 +124,33 @@ kiosk::debug::DebugServer g_debug_server(g_bus, g_display, g_renderer, g_runtime
 unsigned long g_last_diagnostics_print_ms = 0;
 constexpr unsigned long kDiagnosticsPrintIntervalMs = 30000;
 
+// Real, confirmed root cause of a periodic reboot found live (2026-08-26
+// field report: "quét thẻ ... đang kiểm tra rất lâu ... rồi reload lại
+// wifi"): the low-memory supervisor below (WARNING/CRITICAL check +
+// opportunistic journal compaction rescue) used to run ONLY once per
+// kDiagnosticsPrintIntervalMs (30s), piggybacked on the diagnostics-print
+// timer purely because it happened to live in the same `if` block. Each
+// business event costs real internal-SRAM (a JournalRecord's several
+// std::string fields, kept live in EventJournalIndex's in-memory map until
+// compaction runs) that is NEVER reclaimed until compaction actually
+// executes -- confirmed live via a 100-scan/100s stress test: int_free fell
+// from ~180KB to single-digit KB well within one 30s window at a ~1
+// scan/second cadence (unrealistically fast for a human operator, but this
+// device's cumulative event count across a full day's testing reaches the
+// same wall eventually at any cadence, just slower). The compaction
+// policy's OWN "should_consider_compaction()" trigger (event_journal_index.h)
+// watches FLASH journal usage_pct, which stayed under 50% throughout every
+// crash observed -- SRAM and flash-quota pressure are unrelated signals,
+// and only the flash one was ever checked more than once per 30s.
+// Decoupled onto its own MUCH shorter interval so the WARNING/CRITICAL
+// rescue (and, in the worst case, the controlled-reboot escalation) can
+// react within ~1s of real pressure building, not up to 30s later --
+// heap_caps_get_largest_free_block()/get_free_size() are cheap calls,
+// already called this often elsewhere in this same file with no measured
+// cost concern (see send_business_event()'s own failure-path check).
+unsigned long g_last_low_memory_check_ms = 0;
+constexpr unsigned long kLowMemoryCheckIntervalMs = 1000;
+
 // §6 of the 2026-08-25 finish-anti-stuck-recovery follow-up: lightweight UI
 // stall detection. g_display.frame_id() (bumped once per Renderer::end_screen()
 // call -- already existed, this just reuses it) is the "render_generation"
@@ -930,30 +957,18 @@ void loop() {
     }
   }
 
-  if (now - g_last_diagnostics_print_ms >= kDiagnosticsPrintIntervalMs) {
-    g_last_diagnostics_print_ms = now;
-    kiosk::runtime::refresh_memory_fields(g_diagnostics);
-    Serial.printf("{\"level\":\"INFO\",\"code\":\"HEARTBEAT_LOCAL\",\"uptime_ms\":%lu,"
-                  "\"free_heap\":%u,\"largest_block\":%u,\"psram_free\":%u,"
-                  "\"psram_low\":%s}\n",
-                  now, g_diagnostics.free_heap_bytes,
-                  g_diagnostics.largest_free_block_bytes,
-                  g_diagnostics.psram_free_bytes,
-                  kiosk::runtime::is_psram_headroom_low(g_diagnostics) ? "true" : "false");
-#if MESFLOW_DEBUG_API
-    kiosk::health::log_memory_snapshot("PERIODIC_30S");
-    char stack_msg[64];
-    snprintf(stack_msg, sizeof(stack_msg), "task=loopTask high_water_words=%u",
-             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
-    kiosk::health::log_structured("INFO", "TASK_STACK_DIAG", "kiosk_runtime_v2", stack_msg);
-#endif
-
-    // §11 of the self-recovery task -- low-memory supervisor. Deliberately
-    // reading INTERNAL SRAM specifically (not diagnostics.largest_free_block_bytes
-    // above, which is MALLOC_CAP_8BIT -- internal+PSRAM blended, the exact
-    // thing that looked deceptively abundant during the earlier
-    // fragmentation investigation). PROD+DEV both -- this is a safety
-    // feature, not a debug tool.
+  // §11 of the self-recovery task -- low-memory supervisor, on its OWN
+  // ~1s cadence (see kLowMemoryCheckIntervalMs's own comment for the real
+  // incident this decoupling fixes -- it used to only run once per
+  // kDiagnosticsPrintIntervalMs/30s, far too slow to catch per-event SRAM
+  // pressure under any reasonably fast scan cadence). Deliberately reading
+  // INTERNAL SRAM specifically (not diagnostics.largest_free_block_bytes
+  // below, which is MALLOC_CAP_8BIT -- internal+PSRAM blended, the exact
+  // thing that looked deceptively abundant during the earlier fragmentation
+  // investigation). PROD+DEV both -- this is a safety feature, not a debug
+  // tool.
+  if (now - g_last_low_memory_check_ms >= kLowMemoryCheckIntervalMs) {
+    g_last_low_memory_check_ms = now;
     uint32_t internal_largest = static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     uint32_t internal_free = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     auto mem_level = kiosk::health::classify_low_memory(internal_largest);
@@ -981,6 +996,25 @@ void loop() {
                                            static_cast<uint8_t>(g_journal.pressure()), internal_free,
                                            internal_largest);
     }
+  }
+
+  if (now - g_last_diagnostics_print_ms >= kDiagnosticsPrintIntervalMs) {
+    g_last_diagnostics_print_ms = now;
+    kiosk::runtime::refresh_memory_fields(g_diagnostics);
+    Serial.printf("{\"level\":\"INFO\",\"code\":\"HEARTBEAT_LOCAL\",\"uptime_ms\":%lu,"
+                  "\"free_heap\":%u,\"largest_block\":%u,\"psram_free\":%u,"
+                  "\"psram_low\":%s}\n",
+                  now, g_diagnostics.free_heap_bytes,
+                  g_diagnostics.largest_free_block_bytes,
+                  g_diagnostics.psram_free_bytes,
+                  kiosk::runtime::is_psram_headroom_low(g_diagnostics) ? "true" : "false");
+#if MESFLOW_DEBUG_API
+    kiosk::health::log_memory_snapshot("PERIODIC_30S");
+    char stack_msg[64];
+    snprintf(stack_msg, sizeof(stack_msg), "task=loopTask high_water_words=%u",
+             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+    kiosk::health::log_structured("INFO", "TASK_STACK_DIAG", "kiosk_runtime_v2", stack_msg);
+#endif
 
     // §13: uptime has been stable through a full periodic-check cycle with
     // no recovery reboot needed -- safe to clear any persisted same-fault
@@ -1025,4 +1059,37 @@ void loop() {
       }
     }
   }
+
+  // Real, confirmed root cause of a periodic reboot found live (2026-08-26,
+  // "quét thẻ ... đang kiểm tra rất lâu ... rồi reload lại wifi" field
+  // report): loop() ran with NO cooperative yield at all -- every iteration
+  // of this function returns immediately back into Arduino's own loopTask,
+  // which itself runs at priority 1 (tskIDLE_PRIORITY + 1), the SAME
+  // priority AsyncEventSender's/HeartbeatClient's own worker tasks use
+  // (api_client.cpp's send_task_entry, heartbeat_client.cpp's
+  // heartbeat_task_entry -- both end with vTaskDelete(nullptr), a SELF-
+  // deletion). FreeRTOS documents that a task's own stack/TCB cannot be
+  // freed while it's still the one executing -- that memory is only
+  // actually reclaimed later, by the IDLE task (priority 0, strictly
+  // BELOW 1) running and doing the cleanup. With loopTask never yielding,
+  // and worker tasks spawned on every scan (plus every 20s for heartbeat)
+  // also sitting at priority 1, the priority-0 idle task on whichever core
+  // these land on can be starved of scheduling time for long stretches --
+  // self-deleted tasks pile up unreclaimed, internal SRAM drops
+  // (confirmed live: int_free fell from ~180KB to ~9KB over ~110s of
+  // repeated scans, while int_largest independently collapsed to 6644
+  // bytes -- just under a new task's required stack allocation), and the
+  // next xTaskCreate() call fails -- exactly the existing, correct
+  // RECOVERY_TASK_CREATE_FAILED controlled-reboot path this project already
+  // has for that failure mode (kiosk_runtime.cpp's check_send_retry()).
+  // This isn't a bug in that recovery path -- it did its job, rebooting
+  // cleanly rather than wedging -- the bug is upstream: nothing ever gave
+  // idle task a chance to keep up. A single 1-tick (~1ms at the default
+  // 1000Hz tick rate) delay here is the standard, minimal-risk fix for
+  // exactly this FreeRTOS pattern -- negligible next to this loop's own
+  // per-iteration work and the hundreds-of-ms network latencies already
+  // involved, but it guarantees idle (and any other equal-priority task)
+  // gets scheduled at least once per loop() cycle instead of potentially
+  // never.
+  vTaskDelay(1);
 }
