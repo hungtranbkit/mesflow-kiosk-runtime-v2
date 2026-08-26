@@ -1031,6 +1031,17 @@ void KioskRuntime::poll() {
                                    result.outcome.ok ? "EVENT_ACKED" : "EVENT_FAILED", "kiosk_runtime",
                                    msg);
 
+    // Network self-recovery counter -- see consecutive_tcp_connect_fail()'s
+    // doc comment. A success, or any OTHER kind of failure, clears the
+    // streak; only back-to-back TCP_CONNECT_FAIL (every attempt of a fully-
+    // exhausted send failing to even connect, despite WiFi reporting
+    // CONNECTED) counts toward it.
+    if (!result.outcome.ok && result.outcome.error_code == "TCP_CONNECT_FAIL") {
+      ++consecutive_tcp_connect_fail_;
+    } else {
+      consecutive_tcp_connect_fail_ = 0;
+    }
+
     if (!result.outcome.ok) {
       // Transport-level failure (no response at all, or a 4xx/5xx that
       // never reached the business layer -- §83: every business outcome,

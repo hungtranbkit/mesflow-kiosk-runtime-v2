@@ -113,6 +113,20 @@ class KioskRuntime {
   String last_error_code() const { return last_error_code_.c_str(); }
   uint32_t last_latency_ms() const { return last_latency_ms_; }
   int last_retry_count() const { return last_retry_count_; }
+  // Network self-recovery (2026-08-26 field report: TCP_CONNECT_FAIL
+  // persisting across every send despite WiFi.status()==WL_CONNECTED and
+  // the backend verified healthy from elsewhere -- reproduced twice live,
+  // both times only a full device reboot recovered it). Counts CONSECUTIVE
+  // fully-exhausted-all-retries sends whose error_code was specifically
+  // TCP_CONNECT_FAIL -- reset to 0 by any success OR any differently-
+  // classified failure (this must stay a narrow, specific signal, not a
+  // general "network had some trouble" counter). The .ino owns the actual
+  // recovery ACTION (WifiManager::force_reconnect(), escalating to a
+  // controlled reboot) -- this class only ever exposes the count, matching
+  // this codebase's existing convention of KioskRuntime exposing actions/
+  // state for other components to act on rather than holding a dependency
+  // on them itself (see WifiRecoveryController's own forwarding methods).
+  uint32_t consecutive_tcp_connect_fail() const { return consecutive_tcp_connect_fail_; }
 
   // --- Phase 2 diagnostics (§44-46, /debug/device-state) ---
   bool has_state_snapshot() const { return state_projection_.has_snapshot(); }
@@ -214,6 +228,7 @@ class KioskRuntime {
   kiosk::protocol::EventType last_event_type_ = kiosk::protocol::EventType::SCAN;
   bool scan_pending_result_ = false;  // true between the immediate feedback draw and the async result arriving
   String pending_raw_code_;
+  uint32_t consecutive_tcp_connect_fail_ = 0;  // see consecutive_tcp_connect_fail()'s own doc comment above
 
   // --- Scan latency instrumentation (2026-08-26 shared-terminal/latency
   // task) --- millis() checkpoints for a SCAN event only, read back in

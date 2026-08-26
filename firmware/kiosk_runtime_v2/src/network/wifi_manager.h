@@ -40,6 +40,20 @@ class WifiManager {
   // their own real attempt in progress/succeeded, nothing to force there.
   void retry_now();
 
+  // Network self-recovery (2026-08-26 field report): unlike retry_now(),
+  // this is NOT a no-op while state()==CONNECTED -- that's exactly the
+  // case it exists for. Reproduced live, twice: WiFi.status() kept
+  // reporting WL_CONNECTED (this manager's own poll() never saw a drop to
+  // act on) while every new TCP connection attempt to a verified-healthy
+  // backend failed outright (TCP_CONNECT_FAIL) for minutes at a time, only
+  // resolved by a full device reboot. A plain WiFi.disconnect() + fresh
+  // WiFi.begin() (the SAME reconnect path a genuine drop already takes,
+  // just triggered proactively instead of waiting for one) is a much
+  // cheaper first thing to try than a reboot -- and, being the existing
+  // path, it also naturally re-arms bootstrap/offline-replay via the
+  // reconnect_count() bump the .ino already watches for.
+  void force_reconnect();
+
  private:
   kiosk::runtime::EventBus& bus_;
   WifiState state_ = WifiState::DISCONNECTED;

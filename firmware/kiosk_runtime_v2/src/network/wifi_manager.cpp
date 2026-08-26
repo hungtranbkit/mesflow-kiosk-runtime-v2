@@ -104,6 +104,15 @@ void WifiManager::retry_now() {
   next_retry_ms_ = millis();  // poll()'s own DISCONNECTED branch fires on the very next call
 }
 
+void WifiManager::force_reconnect() {
+  kiosk::health::log_structured(
+      "WARN", "NET_WIFI_FORCE_RECONNECT", "wifi_manager",
+      "forcing disconnect+reconnect -- sustained TCP-connect failures despite WiFi reporting CONNECTED");
+  WiFi.disconnect();
+  set_state(WifiState::DISCONNECTED);
+  next_retry_ms_ = millis();  // retry immediately, not after the normal 10s cooldown
+}
+
 void WifiManager::set_state(WifiState new_state) {
   if (new_state == state_) return;
   state_ = new_state;

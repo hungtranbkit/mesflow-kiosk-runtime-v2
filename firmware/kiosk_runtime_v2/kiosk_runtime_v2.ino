@@ -151,6 +151,22 @@ constexpr unsigned long kDiagnosticsPrintIntervalMs = 30000;
 unsigned long g_last_low_memory_check_ms = 0;
 constexpr unsigned long kLowMemoryCheckIntervalMs = 1000;
 
+// Network self-recovery (2026-08-26 field report): see
+// KioskRuntime::consecutive_tcp_connect_fail()'s and
+// WifiManager::force_reconnect()'s own doc comments for the full
+// root-cause writeup -- reproduced live, twice, with only a manual reboot
+// recovering it. RECONNECT is tried first (cheap, ~instant, the same path
+// a genuine Wi-Fi drop already takes); REBOOT only escalates if THAT
+// streak keeps going, mirroring the existing LOW_MEMORY supervisor's own
+// "try the cheap fix, escalate only if it didn't work" shape.
+// g_network_reconnect_attempted_this_streak prevents calling
+// force_reconnect() again on every single subsequent failure once one has
+// already been triggered for this streak -- it's cleared the moment the
+// streak itself clears (a success, or a differently-classified failure).
+constexpr uint32_t kNetworkStuckReconnectThreshold = 2;
+constexpr uint32_t kNetworkStuckRebootThreshold = 5;
+bool g_network_reconnect_attempted_this_streak = false;
+
 // §6 of the 2026-08-25 finish-anti-stuck-recovery follow-up: lightweight UI
 // stall detection. g_display.frame_id() (bumped once per Renderer::end_screen()
 // call -- already existed, this just reuses it) is the "render_generation"
@@ -821,6 +837,31 @@ void loop() {
 #if MESFLOW_DEBUG_API
   g_debug_server.poll();
 #endif
+
+  // Network self-recovery -- see kNetworkStuckReconnectThreshold's own
+  // comment above for the full context.
+  {
+    uint32_t streak = g_runtime.consecutive_tcp_connect_fail();
+    if (streak == 0) {
+      g_network_reconnect_attempted_this_streak = false;
+    } else if (streak == kNetworkStuckReconnectThreshold && !g_network_reconnect_attempted_this_streak) {
+      g_network_reconnect_attempted_this_streak = true;
+      kiosk::health::record_recovery_event(
+          kiosk::health::RecoveryCode::NETWORK_TIMEOUT,
+          "sustained TCP_CONNECT_FAIL despite Wi-Fi CONNECTED -- forcing reconnect", 0, 0, 0);
+      g_wifi.force_reconnect();
+    } else if (streak >= kNetworkStuckRebootThreshold) {
+      // The forced reconnect above didn't help (the streak kept growing
+      // past it) -- escalate the same way LOW_MEMORY does when its own
+      // cheap fix doesn't recover things either.
+      kiosk::health::request_controlled_reboot(
+          kiosk::health::RecoveryCode::NETWORK_TIMEOUT,
+          "forced Wi-Fi reconnect did not recover TCP connectivity", static_cast<uint8_t>(g_journal.pressure()),
+          static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+          static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
+      // never returns.
+    }
+  }
 
   if (g_wifi.state() == kiosk::network::WifiState::CONNECTED) {
     // §19: a reconnect (not the first-ever connect this boot) re-arms the
