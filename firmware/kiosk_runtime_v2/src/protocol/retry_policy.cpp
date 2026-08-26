@@ -14,6 +14,17 @@ HttpOutcome classify_http_result(int raw_status, int retry_after_header_s) {
     return out;
   }
 
+  if (raw_status == kResponseTooLargeMarker) {
+    // Response-size guard (2026-08-26): rejected on Content-Length alone,
+    // before ever reading the body. Deliberately NOT retryable -- a
+    // pathologically large response from a given endpoint is a server-side
+    // condition (bug/misconfiguration/compromise), not a transient network
+    // blip that a retry would ever fix.
+    out.error_code = "RESPONSE_TOO_LARGE";
+    out.retryable = false;
+    return out;
+  }
+
   if (raw_status <= 0) {
     // Transport-level failure (no HTTP status ever received). Map known
     // ESP32 HTTPClient negative codes to the simplified taxonomy; anything
@@ -24,7 +35,6 @@ HttpOutcome classify_http_result(int raw_status, int retry_after_header_s) {
         out.error_code = "DNS_FAIL";
         break;
       case -11:  // HTTPC_ERROR_READ_TIMEOUT
-      case -999:  // this codebase's own hard-deadline-exceeded marker
         out.error_code = "HTTP_TIMEOUT";
         break;
       case -1:   // HTTPC_ERROR_CONNECTION_REFUSED

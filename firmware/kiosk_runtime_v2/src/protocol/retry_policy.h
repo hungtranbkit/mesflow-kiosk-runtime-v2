@@ -19,21 +19,29 @@ struct HttpOutcome {
 // `raw_status` is whatever the underlying HTTP client returned: a real HTTP
 // status code (100-599), or a library-specific negative "transport error"
 // code (e.g. ESP32 HTTPClient: -1 connection refused, -11 read timeout), or
-// one of this codebase's own negative markers: -999 hard-deadline-exceeded
-// (api_client.cpp), or kDnsFailMarker (below) for a pre-flight DNS
-// resolution failure detected BEFORE any HTTP attempt was even made.
+// one of this codebase's own negative markers: kDnsFailMarker (below) for a
+// pre-flight DNS resolution failure detected BEFORE any HTTP attempt was
+// even made, or kResponseTooLargeMarker for a response rejected on size
+// alone, before ever reading its body.
 // `retry_after_header_s`: parsed Retry-After value if a 429 response
 // carried one, else -1.
 //
 // Simplified error taxonomy (2026-08-24, plain-HTTP migration -- see
 // docs/KIOSK_V2_PLAIN_HTTP.md): WIFI_DOWN / DNS_FAIL / TCP_CONNECT_FAIL /
 // HTTP_TIMEOUT / HTTP_4XX / HTTP_5XX / API_RATE_LIMITED /
-// PROTOCOL_INVALID_RESPONSE. No TLS-specific codes remain on this path --
-// WiFiClientSecure is no longer used by the active transport at all, so
-// there is nothing for a TLS-specific code to ever describe here.
-// WIFI_DOWN itself is generated directly by AsyncEventSender::send() (it
-// short-circuits before ever calling this function), not by this switch.
+// PROTOCOL_INVALID_RESPONSE / RESPONSE_TOO_LARGE. No TLS-specific codes
+// remain on this path -- WiFiClientSecure is no longer used by the active
+// transport at all, so there is nothing for a TLS-specific code to ever
+// describe here. WIFI_DOWN itself is generated directly by
+// AsyncEventSender::send() (it short-circuits before ever calling this
+// function), not by this switch.
+//
+// (Simplicity/memory pass, 2026-08-26: a -999 "hard-deadline-exceeded"
+// marker used to live here, alongside RUNTIME_HTTP_HARD_DEADLINE_MS in
+// runtime_config.h -- both dead, nothing ever produced -999. Removed
+// together; see that constant's own removal comment.)
 constexpr int kDnsFailMarker = -1000;
+constexpr int kResponseTooLargeMarker = -1001;
 
 HttpOutcome classify_http_result(int raw_status, int retry_after_header_s = -1);
 

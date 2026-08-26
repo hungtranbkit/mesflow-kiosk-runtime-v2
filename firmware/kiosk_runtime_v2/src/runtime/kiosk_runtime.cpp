@@ -337,23 +337,33 @@ String KioskRuntime::state_endpoint_url() const {
 // runtime has no separate "silent background" rendering mode. Documented
 // here rather than solved -- see the final report's Known Gaps.
 void KioskRuntime::start_offline_replay_if_needed() {
-  if (replaying_ || replay_next_ < replay_queue_.size()) return;  // already have/working a queue
+  if (replaying_ || replay_next_ < replay_event_ids_.size()) return;  // already have/working a queue
   auto pending = journal_.pending_in_device_seq_order();
   if (pending.empty()) return;
 
-  replay_queue_.clear();
-  replay_queue_.reserve(pending.size());
+  // Memory-simplification pass (2026-08-26, "keep the ESP runtime simple
+  // and disposable per request"): this used to copy each pending record's
+  // FULL payload (the original event's JSON envelope, potentially a few
+  // hundred bytes) into a second, parallel ReplayItem vector -- a real
+  // duplication with no correctness purpose, since journal_.find() can
+  // always look the record back up fresh, in O(log n), at the exact moment
+  // it's about to be sent. Only the (small, fixed-size) event_id strings
+  // are queued now -- total replay-queue memory is proportional to the
+  // NUMBER of pending events, never their combined payload size, matching
+  // "replay should never load the full offline history into memory."
+  replay_event_ids_.clear();
+  replay_event_ids_.reserve(pending.size());
   for (const auto* record : pending) {
-    replay_queue_.push_back(ReplayItem{record->event_id, record->payload, record->device_seq});
+    replay_event_ids_.push_back(record->event_id);
   }
   replay_next_ = 0;
   kiosk::health::log_structured(
       "INFO", "OFFLINE_REPLAY_START", "kiosk_runtime",
-      (std::string("queued=") + std::to_string(replay_queue_.size())).c_str());
+      (std::string("queued=") + std::to_string(replay_event_ids_.size())).c_str());
 }
 
 void KioskRuntime::check_offline_replay() {
-  if (replay_next_ >= replay_queue_.size()) {
+  if (replay_next_ >= replay_event_ids_.size()) {
     if (replaying_) {
       // Just finished the last item's send (poll() below clears replaying_
       // once its result lands) -- nothing left to do until the next
@@ -365,14 +375,26 @@ void KioskRuntime::check_offline_replay() {
   if (sender_.busy() || send_retry_pending_) return;  // a LIVE scan/keypress send has priority
   if (identity_.state() != ProvisioningState::ACTIVE || env_mismatch_) return;
 
-  const ReplayItem& item = replay_queue_[replay_next_];
-  bool started = sender_.send(api_endpoint_, item.payload.c_str(), item.event_id, item.device_seq);
+  const std::string& event_id = replay_event_ids_[replay_next_];
+  const kiosk::protocol::JournalRecord* record = journal_.find(event_id);
+  if (record == nullptr) {
+    // PENDING/IN_FLIGHT records are never compacted away (see
+    // EventJournalIndex's own compaction-policy comment), so this should
+    // never actually happen -- but if the journal state ever changes out
+    // from under this queue some other way, skip rather than dereference a
+    // null pointer.
+    kiosk::health::log_structured("ERROR", "OFFLINE_REPLAY_RECORD_MISSING", "kiosk_runtime", event_id.c_str());
+    ++replay_next_;
+    return;
+  }
+
+  bool started = sender_.send(api_endpoint_, record->payload.c_str(), record->event_id, record->device_seq);
   if (started) {
     replaying_ = true;
     kiosk::health::log_structured(
         "INFO", "OFFLINE_REPLAY_SEND", "kiosk_runtime",
-        (std::string("event_id=") + item.event_id + " device_seq=" + std::to_string(item.device_seq) +
-         " (" + std::to_string(replay_next_ + 1) + "/" + std::to_string(replay_queue_.size()) + ")")
+        (std::string("event_id=") + record->event_id + " device_seq=" + std::to_string(record->device_seq) +
+         " (" + std::to_string(replay_next_ + 1) + "/" + std::to_string(replay_event_ids_.size()) + ")")
             .c_str());
   }
   // If it didn't start (sender_ raced busy between the check above and
@@ -1131,6 +1153,14 @@ void KioskRuntime::poll() {
   check_send_retry();
   check_error_view_timeout();
   check_ui_timeout();
+  // Periodic fallback trigger (see last_replay_fallback_check_ms_'s own doc
+  // comment) -- independent of the reconnect-driven trigger, so a pending
+  // backlog left behind by a transient failure (never a real Wi-Fi drop)
+  // still gets retried on a healthy, still-connected link.
+  if (millis() - last_replay_fallback_check_ms_ >= kReplayFallbackCheckIntervalMs) {
+    last_replay_fallback_check_ms_ = millis();
+    start_offline_replay_if_needed();
+  }
   check_offline_replay();
 
   // §6/§18: keep the status bar's queue count current. Cheap (an in-memory

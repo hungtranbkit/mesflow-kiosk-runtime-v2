@@ -13,10 +13,14 @@
 // Local scan -> presentation feedback target (§12).
 #define RUNTIME_TARGET_LOCAL_FEEDBACK_MS 100
 
-// Server interaction UX targets.
-#define RUNTIME_TARGET_SERVER_UX_MS 300
-#define RUNTIME_TARGET_SERVER_UX_WARN_MS 800
-#define RUNTIME_TARGET_SERVER_UX_DEGRADED_MS 2000
+// (Simplicity/memory pass, 2026-08-26: RUNTIME_TARGET_SERVER_UX_MS/
+// _WARN_MS/_DEGRADED_MS used to live here -- another set of dead,
+// misleading configuration, same class as RUNTIME_HTTP_HARD_DEADLINE_MS
+// below: defined, described as "targets to benchmark against", never
+// actually referenced by any code anywhere in this firmware. Removed
+// rather than kept around unenforced -- "do not retain misleading
+// configuration.")
+
 // Scan-latency investigation (2026-08-26): lowered from 5000. Real evidence
 // from the physical test board on its normal shop-floor Wi-Fi ("Airport"):
 // the backend itself is consistently fast (confirmed via kiosk_v2.py's own
@@ -35,18 +39,39 @@
 // is unchanged -- no live evidence it needs to change, only the per-attempt
 // ceiling did.
 #define RUNTIME_HTTP_TIMEOUT_MS 2500
-// NOTE (found auditing this file for the same task, NOT fixed here -- flagged
-// in the field report instead): RUNTIME_HTTP_HARD_DEADLINE_MS below is dead
-// code. Its own comment describes "a separate FreeRTOS task + caller-side
-// deadline" enforced by api_client.cpp -- grepping the actual source shows
-// no such enforcement exists; the constant is defined and never referenced
-// anywhere. HTTPClient's own setTimeout()/setConnectTimeout() (which IS
-// wired up, and which this task's live testing confirms actually fires
-// around its configured value) is currently the ONLY bound on a single
-// attempt. Implementing the caller-side hard backstop this comment already
-// describes is a real, independent gap -- left for a dedicated pass rather
-// than folded into this scan-latency fix.
-#define RUNTIME_HTTP_HARD_DEADLINE_MS 8000
+// (Simplicity/memory pass, 2026-08-26: RUNTIME_HTTP_HARD_DEADLINE_MS used to
+// live here, flagged in the previous round's field report as dead code --
+// defined, described in its own comment as "a separate FreeRTOS task +
+// caller-side deadline" enforced by api_client.cpp, but grepping the actual
+// source showed no such enforcement existed anywhere; only HTTPClient's own
+// setTimeout()/setConnectTimeout() (which IS wired up and confirmed live to
+// actually fire around RUNTIME_HTTP_TIMEOUT_MS) ever bounded a single
+// attempt. Removed rather than implemented: this task's own explicit
+// instruction is "if it is dead/unimplemented: enforce it correctly, or
+// remove it" -- a real caller-side hard backstop is a legitimate future
+// improvement, but building new complexity is the opposite of this pass's
+// goal, and no live evidence has ever shown HTTPClient's own timeout
+// failing to fire on this board.)
+
+// Response-size guard (simplicity/memory pass, 2026-08-26): a real,
+// previously-unbounded gap found auditing every HTTP call site in this
+// firmware -- api_client.cpp/state_client.cpp/bootstrap_client.cpp all
+// called http.getString() unconditionally, with no check on the response
+// size at all, before this. Every real response this protocol ever sends
+// is small (a live /events response is a few hundred bytes; a live UI
+// bundle download -- the single largest legitimate payload this firmware
+// ever fetches, sharing state_client.cpp's same code path -- measured
+// 1772 bytes against the real backend). One shared cap, generous enough
+// to leave ~9x headroom over that real bundle size, is simpler than a
+// separate constant per endpoint and still small enough to protect the
+// ~200KB+ internal-SRAM budget from a single pathological response (a
+// server bug, misconfiguration, or compromised backend) ever trying to
+// allocate an unbounded String. A response whose Content-Length is
+// unknown (chunked, or the header missing) is treated the SAME as
+// oversized -- rejected before ever calling getString() -- since this
+// protocol's own real responses always carry a real Content-Length
+// (plain Flask JSON, never streamed).
+#define RUNTIME_MAX_RESPONSE_BODY_BYTES 16384
 
 // Scanner physical-duplicate suppression window. Not a business dedupe
 // window — just "the same physical swipe read twice" (§26).

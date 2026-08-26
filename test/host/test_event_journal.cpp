@@ -379,19 +379,35 @@ int main() {
       return kJournalFrameOverheadBytes + static_cast<uint32_t>(body.size());
     };
 
-    // Non-terminal records: always kept, regardless of age.
+    // PENDING/IN_FLIGHT: always kept, regardless of age -- genuinely
+    // unsynced, must never be silently dropped.
     JournalRecord pending = make_record("evt-pending", JournalSyncStatus::PENDING);
     pending.created_uptime_ms = 100;
     JournalRecord inflight = make_record("evt-inflight", JournalSyncStatus::IN_FLIGHT);
     inflight.created_uptime_ms = 200;
-    JournalRecord conflict = make_record("evt-conflict", JournalSyncStatus::CONFLICT);
-    conflict.created_uptime_ms = 300;
-    JournalRecord human_review = make_record("evt-human-review", JournalSyncStatus::HUMAN_REVIEW);
-    human_review.created_uptime_ms = 400;
     idx.record_appended_event(pending, real_frame_size(pending));
     idx.record_appended_event(inflight, real_frame_size(inflight));
-    idx.record_appended_event(conflict, real_frame_size(conflict));
-    idx.record_appended_event(human_review, real_frame_size(human_review));
+
+    // CONFLICT/HUMAN_REVIEW joined the bounded-terminal-bucket group
+    // 2026-08-26 (a real bug: these used to be kept in full forever, and a
+    // live 300-scan stress test accumulated 43 CONFLICT records with no
+    // ceiling at all, a direct contributor to that run's SRAM exhaustion --
+    // see CompactionPolicy's own doc comment). 3 CONFLICT records at
+    // increasing created_uptime_ms -- only the 2 newest survive a retention
+    // count of 2, same shape as ACKED/REJECTED below.
+    for (int i = 0; i < 3; ++i) {
+      JournalRecord r = make_record("evt-conflict-" + std::to_string(i), JournalSyncStatus::CONFLICT);
+      r.created_uptime_ms = 3000 + i;  // evt-conflict-2 is newest
+      idx.record_appended_event(r, real_frame_size(r));
+    }
+    // 3 HUMAN_REVIEW records -- only the 2 newest should survive (unused by
+    // any live code path today -- see is_terminal()'s own comment -- but
+    // the same bounded-retention reasoning applies if it's ever wired up).
+    for (int i = 0; i < 3; ++i) {
+      JournalRecord r = make_record("evt-human-review-" + std::to_string(i), JournalSyncStatus::HUMAN_REVIEW);
+      r.created_uptime_ms = 4000 + i;  // evt-human-review-2 is newest
+      idx.record_appended_event(r, real_frame_size(r));
+    }
 
     // 5 ACKED records at increasing created_uptime_ms -- only the 2 newest
     // should survive a retention count of 2.
@@ -407,31 +423,41 @@ int main() {
       idx.record_appended_event(r, real_frame_size(r));
     }
 
-    check(idx.record_count() == 12, "12 records appended before compaction (4 non-terminal + 5 acked + 3 rejected)");
+    check(idx.record_count() == 16,
+          "16 records appended before compaction (2 non-terminal + 5 acked + 3 rejected + 3 conflict + 3 human_review)");
 
     EventJournalIndex::CompactionPolicy policy;
     policy.acked_retention_count = 2;
     policy.rejected_retention_count = 2;
+    policy.conflict_retention_count = 2;
+    policy.human_review_retention_count = 2;
     std::vector<std::string> keep = idx.select_records_to_keep(policy);
     auto contains = [&](const std::string& id) {
       return std::find(keep.begin(), keep.end(), id) != keep.end();
     };
 
-    check(keep.size() == 8, "4 non-terminal + 2 kept acked + 2 kept rejected = 8 survivors");
-    check(contains("evt-pending") && contains("evt-inflight") && contains("evt-conflict") && contains("evt-human-review"),
-          "all 4 non-terminal records survive selection regardless of age");
+    check(keep.size() == 10, "2 non-terminal + 2 each of acked/rejected/conflict/human_review = 10 survivors");
+    check(contains("evt-pending") && contains("evt-inflight"),
+          "PENDING/IN_FLIGHT survive selection regardless of age -- genuinely unsynced");
     check(contains("evt-acked-4") && contains("evt-acked-3"), "the 2 NEWEST acked records survive");
     check(!contains("evt-acked-0") && !contains("evt-acked-1") && !contains("evt-acked-2"),
           "the 3 OLDEST acked records are dropped from the keep-list");
     check(contains("evt-rejected-2") && contains("evt-rejected-1"), "the 2 newest rejected records survive");
     check(!contains("evt-rejected-0"), "the oldest rejected record is dropped from the keep-list");
+    check(contains("evt-conflict-2") && contains("evt-conflict-1"), "the 2 newest conflict records survive");
+    check(!contains("evt-conflict-0"), "the oldest conflict record is dropped from the keep-list -- NOT kept forever");
+    check(contains("evt-human-review-2") && contains("evt-human-review-1"),
+          "the 2 newest human_review records survive");
+    check(!contains("evt-human-review-0"), "the oldest human_review record is dropped from the keep-list");
 
     uint32_t used_before = idx.used_bytes();
     idx.rebuild_after_compaction(keep);
-    check(idx.record_count() == 8, "rebuild_after_compaction() shrinks record_count() to exactly the keep-list size");
+    check(idx.record_count() == 10, "rebuild_after_compaction() shrinks record_count() to exactly the keep-list size");
     check(idx.used_bytes() < used_before, "rebuild_after_compaction() shrinks used_bytes() (fewer surviving frames)");
     check(idx.find("evt-acked-0") == nullptr,
           "a dropped record is genuinely gone from find() after rebuild, not just absent from the keep-list");
+    check(idx.find("evt-conflict-0") == nullptr,
+          "a dropped CONFLICT record is genuinely gone from find() after rebuild -- proves it's no longer kept forever");
     check(idx.find("evt-pending") != nullptr, "a kept non-terminal record is still findable after rebuild");
     check(idx.find("evt-acked-4") != nullptr, "the newest kept acked record is still findable after rebuild");
 
@@ -440,8 +466,10 @@ int main() {
     EventJournalIndex::CompactionPolicy generous_policy;
     generous_policy.acked_retention_count = 100;
     generous_policy.rejected_retention_count = 100;
+    generous_policy.conflict_retention_count = 100;
+    generous_policy.human_review_retention_count = 100;
     std::vector<std::string> keep_all = idx.select_records_to_keep(generous_policy);
-    check(keep_all.size() == 8, "a retention count larger than the bucket keeps every remaining record, no crash/overrun");
+    check(keep_all.size() == 10, "a retention count larger than the bucket keeps every remaining record, no crash/overrun");
   }
 
   // --- should_consider_compaction() matches the 70% WARNING boundary ---

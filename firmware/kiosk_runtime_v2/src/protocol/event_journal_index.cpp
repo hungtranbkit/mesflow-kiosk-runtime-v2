@@ -5,8 +5,13 @@
 namespace kiosk::protocol {
 
 namespace {
+// See CompactionPolicy's own doc comment for why CONFLICT/HUMAN_REVIEW
+// joined ACKED/REJECTED here (2026-08-26) -- all four are equally "never
+// revisited by any live code path again" once created, unlike PENDING/
+// IN_FLIGHT which genuinely still need to be resent.
 bool is_terminal(JournalSyncStatus s) {
-  return s == JournalSyncStatus::ACKED || s == JournalSyncStatus::REJECTED;
+  return s == JournalSyncStatus::ACKED || s == JournalSyncStatus::REJECTED ||
+         s == JournalSyncStatus::CONFLICT || s == JournalSyncStatus::HUMAN_REVIEW;
 }
 }  // namespace
 
@@ -120,6 +125,8 @@ std::vector<std::string> EventJournalIndex::select_records_to_keep(const Compact
   };
   collect_and_trim(JournalSyncStatus::ACKED, policy.acked_retention_count);
   collect_and_trim(JournalSyncStatus::REJECTED, policy.rejected_retention_count);
+  collect_and_trim(JournalSyncStatus::CONFLICT, policy.conflict_retention_count);
+  collect_and_trim(JournalSyncStatus::HUMAN_REVIEW, policy.human_review_retention_count);
 
   return keep;
 }

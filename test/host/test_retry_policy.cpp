@@ -25,10 +25,6 @@ int main() {
     check(!timeout.ok && timeout.error_code == "HTTP_TIMEOUT" && timeout.retryable,
           "-11 (read timeout) -> HTTP_TIMEOUT, retryable");
 
-    auto hard_deadline = classify_http_result(-999);
-    check(!hard_deadline.ok && hard_deadline.error_code == "HTTP_TIMEOUT" && hard_deadline.retryable,
-          "-999 (our hard-deadline marker) -> HTTP_TIMEOUT, retryable");
-
     auto refused = classify_http_result(-1);
     check(refused.error_code == "TCP_CONNECT_FAIL" && refused.retryable,
           "-1 (connection refused) -> TCP_CONNECT_FAIL, retryable");
@@ -36,6 +32,14 @@ int main() {
     auto dns_fail = classify_http_result(kDnsFailMarker);
     check(dns_fail.error_code == "DNS_FAIL" && dns_fail.retryable,
           "kDnsFailMarker (pre-flight WiFi.hostByName() failure) -> DNS_FAIL, retryable");
+
+    // Response-size guard (2026-08-26 memory-simplification pass): rejected
+    // on Content-Length alone, before ever reading the body -- deliberately
+    // NOT retryable (a pathologically large response is a server-side
+    // condition a retry can't fix).
+    auto too_large = classify_http_result(kResponseTooLargeMarker);
+    check(!too_large.ok && too_large.error_code == "RESPONSE_TOO_LARGE" && !too_large.retryable,
+          "kResponseTooLargeMarker -> RESPONSE_TOO_LARGE, NOT retryable");
 
     auto bad_request = classify_http_result(400);
     check(!bad_request.retryable && bad_request.error_code == "HTTP_4XX",

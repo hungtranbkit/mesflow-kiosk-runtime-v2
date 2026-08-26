@@ -83,8 +83,21 @@ int perform_single_attempt(const String& url, const String& json_body, String* o
   if (status == 429 && out_retry_after) {
     *out_retry_after = http.header("Retry-After");
   }
-  if (status > 0 && out_body) {
-    *out_body = std::string(http.getString().c_str());
+  if (status > 0) {
+    // Response-size guard (2026-08-26): reject on Content-Length alone,
+    // before ever calling getString() -- see RUNTIME_MAX_RESPONSE_BODY_BYTES'
+    // own doc comment. getSize() < 0 means unknown/chunked length, treated
+    // the same as oversized (this protocol's real responses always carry a
+    // real Content-Length).
+    int content_length = http.getSize();
+    if (content_length < 0 || content_length > RUNTIME_MAX_RESPONSE_BODY_BYTES) {
+      kiosk::health::log_structured(
+          "ERROR", "API_ERR_RESPONSE_TOO_LARGE", "api_client",
+          (std::string("content_length=") + std::to_string(content_length)).c_str());
+      http.end();
+      return kiosk::protocol::kResponseTooLargeMarker;
+    }
+    if (out_body) *out_body = std::string(http.getString().c_str());
   }
   http.end();
   return status;
@@ -98,7 +111,17 @@ struct SendJob {
   uint64_t device_seq;
 };
 
-constexpr int kMaxAttempts = 5;
+// Simplicity/memory pass (2026-08-26): lowered from 5. "Choose one coherent
+// [timeout] policy... foreground retries: max 1 when transient" -- with
+// RUNTIME_HTTP_TIMEOUT_MS=2500ms, 5 attempts meant a single fully-exhausted
+// event could take up to ~28-30s wall-clock (confirmed live) before giving
+// up, which is also exactly what let a stuck-network episode take a long
+// time to even reach this codebase's OWN detection threshold for it
+// (KioskRuntime::consecutive_tcp_connect_fail()). 2 attempts (1 initial +
+// 1 retry) bounds a genuinely bad request to ~5-6s worst case instead,
+// without giving up on the single most common real case this exists for --
+// a merely transient blip that succeeds on its very next try.
+constexpr int kMaxAttempts = 2;
 
 void send_task_entry(void* arg) {
   SendJob* job = static_cast<SendJob*>(arg);

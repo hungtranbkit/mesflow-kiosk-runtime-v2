@@ -80,7 +80,9 @@ class EventJournalIndex {
   // whole protocol's ordering authority (docs/PROTOCOL.md).
   std::vector<const JournalRecord*> pending_in_device_seq_order() const;
 
-  // --- Compaction (2026-08-24, self-recovery task) ---
+  // --- Compaction (2026-08-24, self-recovery task; retention scope widened
+  // 2026-08-26 "keep the ESP runtime simple and disposable per request"
+  // pass) ---
   // Real, live problem this fixes: the in-memory index kept EVERY record
   // ever appended forever (records_ never shrank), and on-disk usage grew
   // unbounded the same way -- a device left running for a full day of
@@ -88,15 +90,40 @@ class EventJournalIndex {
   // internal-SRAM pressure caused xTaskCreate() itself to start failing
   // (a genuine, reproduced "kiosk stuck on an error screen" incident).
   //
-  // PENDING/IN_FLIGHT/CONFLICT/HUMAN_REVIEW are ALWAYS kept in full --
-  // dropping an unsynced event would violate "never silently overwrite
-  // unsynced business events" (docs/OFFLINE.md). Only the two TERMINAL
-  // states (ACKED, REJECTED) are bounded: the N most-recently-created of
-  // each survive (for idempotency-replay/diagnostic value), the rest are
-  // dropped from both the index and the next on-disk rewrite.
+  // Only PENDING/IN_FLIGHT are ALWAYS kept in full -- dropping a genuinely
+  // unsynced event would violate "never silently overwrite unsynced
+  // business events" (docs/OFFLINE.md). CONFLICT and HUMAN_REVIEW used to
+  // ALSO be kept in full, on the same reasoning -- a REAL bug found live
+  // during a 300-scan stress test (2026-08-26): unlike PENDING/IN_FLIGHT,
+  // a CONFLICT record is never revisited by any code path once created
+  // (kiosk_runtime.cpp sets it exactly once, right before start_resync(),
+  // and nothing ever reads a CONFLICT-status record back out again --
+  // pending_in_device_seq_order() only selects PENDING/IN_FLIGHT). Once the
+  // resync it triggers completes, the specific failed attempt it recorded
+  // is done -- the operator's actual action, if still needed, happens via
+  // a brand-new event with its own event_id, never a retry of the old one.
+  // That makes CONFLICT (and HUMAN_REVIEW, unused today but the same
+  // reasoning applies if it's ever wired up) exactly as TERMINAL as ACKED/
+  // REJECTED for retention purposes -- confirmed live: this codebase's own
+  // "always keep in full" policy let a real device accumulate 43 CONFLICT
+  // records in ~200 seconds with no ceiling at all, a direct contributor
+  // to that stress run's internal-SRAM exhaustion and reboot. All four
+  // terminal buckets are now bounded the same way: the N most-recently-
+  // created of each survive (for diagnostic value), the rest are dropped
+  // from both the index and the next on-disk rewrite.
+  // Lowered from 20 each (2026-08-26, same stress test): 20x4=80 records
+  // kept forever even right after a compaction is a real steady-state
+  // floor (a few hundred bytes each) that a sustained scan rate can refill
+  // and blow past before the NEXT compaction has a chance to run. 5 each
+  // (20 total floor) keeps meaningful recent diagnostic history per bucket
+  // while cutting that floor 4x -- combined with starting compaction at
+  // the WARNING threshold instead of waiting for CRITICAL (see loop()'s own
+  // comment), this is the second half of the fix for that same incident.
   struct CompactionPolicy {
-    uint32_t acked_retention_count = 20;
-    uint32_t rejected_retention_count = 20;
+    uint32_t acked_retention_count = 5;
+    uint32_t rejected_retention_count = 5;
+    uint32_t conflict_retention_count = 5;
+    uint32_t human_review_retention_count = 5;
   };
 
   // Pure decision: which event_ids should survive compaction under this

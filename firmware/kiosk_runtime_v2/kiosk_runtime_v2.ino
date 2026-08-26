@@ -150,6 +150,15 @@ constexpr unsigned long kDiagnosticsPrintIntervalMs = 30000;
 // cost concern (see send_business_event()'s own failure-path check).
 unsigned long g_last_low_memory_check_ms = 0;
 constexpr unsigned long kLowMemoryCheckIntervalMs = 1000;
+// See the CRITICAL branch's own comment (below, in loop()) for the real
+// bug this pair fixes: the reactive rescue used to call the BLOCKING
+// compact() (measured ~4.7s) and reboot immediately if still CRITICAL
+// right after -- now it starts/lets run the non-blocking incremental
+// compact_tick() path instead, and only escalates to reboot after CRITICAL
+// has persisted this many consecutive ~1s checks (10s total patience),
+// giving compaction a real chance to actually catch up first.
+uint32_t g_consecutive_critical_low_memory_checks = 0;
+constexpr uint32_t kCriticalRebootPatienceChecks = 10;
 
 // Network self-recovery (2026-08-26 field report): see
 // KioskRuntime::consecutive_tcp_connect_fail()'s and
@@ -1014,28 +1023,67 @@ void loop() {
     uint32_t internal_free = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     auto mem_level = kiosk::health::classify_low_memory(internal_largest);
     if (mem_level == kiosk::health::LowMemoryLevel::WARNING) {
+      // Real bug found live (2026-08-26, 300-scan stress test): compaction
+      // used to only ever start once CRITICAL was ALREADY hit -- by then,
+      // under any sustained scan rate, a real backlog had already built up
+      // (retention trims to a handful of records once compaction actually
+      // runs, but nothing started that process early). Starting it here,
+      // at the EARLIER WARNING threshold, gives the incremental
+      // compact_tick() path (already running every loop() iteration
+      // whenever active) a real head start before things get critical,
+      // instead of only reacting after the fact.
+      if (!g_journal.compaction_active() && g_journal.record_count() > 0) {
+        g_journal.begin_compaction();
+      }
       kiosk::health::record_recovery_event(kiosk::health::RecoveryCode::LOW_MEMORY,
                                            "internal SRAM WARNING -- largest contiguous block low",
                                            static_cast<uint8_t>(g_journal.pressure()), internal_free,
                                            internal_largest);
     } else if (mem_level == kiosk::health::LowMemoryLevel::CRITICAL) {
-      // Try the single most likely real fix first (fewer live JournalRecord
-      // entries in RAM directly frees heap, unlike most other "free memory"
-      // options this codebase has) -- re-check afterward before escalating.
-      if (g_journal.record_count() > 0) g_journal.compact();
-      internal_largest = static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-      internal_free = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-      if (kiosk::health::classify_low_memory(internal_largest) == kiosk::health::LowMemoryLevel::CRITICAL) {
+      // Real bug found live (2026-08-26, 300-scan stress test): this used
+      // to call g_journal.compact() -- the BLOCKING, one-shot compaction --
+      // right here. That function measured ~4.7s wall-clock to finish on
+      // real hardware (this codebase's OWN routine 30s-timer compaction
+      // path already knew this and deliberately uses the INCREMENTAL
+      // begin_compaction()+compact_tick() pair instead, specifically
+      // because "a full compaction measured ~4.2s blocking the main loop
+      // (and therefore scanner/keypad/display polling)" -- see that code's
+      // own comment above). Calling the blocking version here meant the
+      // ONE moment memory pressure is already critical was ALSO the moment
+      // this froze the entire loop() -- including the scanner/keypad
+      // polling and serial command processing that would otherwise let
+      // pressure ease -- for multiple seconds, worsening exactly the
+      // problem it was trying to fix. Confirmed live: the device rebooted
+      // repeatedly even immediately AFTER a compaction that successfully
+      // shrank the record count, because the blocking call itself was part
+      // of the pressure.
+      //
+      // Fixed to start (or let continue) the SAME incremental compaction
+      // the routine path already uses -- compact_tick() above already runs
+      // every loop() iteration whenever compaction_active(), so this only
+      // needs to START one if none is running yet. Escalating to a
+      // controlled reboot is now PATIENT: only after CRITICAL has persisted
+      // for kCriticalRebootPatienceChecks consecutive ~1s checks WHILE
+      // compaction has had a real chance to run, not immediately upon the
+      // first CRITICAL reading (§22: "watchdog/reboot should be last
+      // resort, not normal memory management").
+      if (!g_journal.compaction_active() && g_journal.record_count() > 0) {
+        g_journal.begin_compaction();
+      }
+      ++g_consecutive_critical_low_memory_checks;
+      if (g_consecutive_critical_low_memory_checks >= kCriticalRebootPatienceChecks) {
         kiosk::health::request_controlled_reboot(
             kiosk::health::RecoveryCode::LOW_MEMORY,
-            "internal SRAM CRITICAL even after journal compaction -- no more application-level relief available",
+            "internal SRAM stayed CRITICAL despite incremental journal compaction -- no more application-level relief available",
             static_cast<uint8_t>(g_journal.pressure()), internal_free, internal_largest);
         // never returns.
       }
       kiosk::health::record_recovery_event(kiosk::health::RecoveryCode::LOW_MEMORY,
-                                           "internal SRAM was CRITICAL, journal compaction recovered it",
+                                           "internal SRAM CRITICAL -- incremental journal compaction running",
                                            static_cast<uint8_t>(g_journal.pressure()), internal_free,
                                            internal_largest);
+    } else {
+      g_consecutive_critical_low_memory_checks = 0;
     }
   }
 

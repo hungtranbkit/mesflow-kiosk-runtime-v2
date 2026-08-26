@@ -86,6 +86,18 @@ void HeartbeatClient::poll(const String& backend_url) {
     return;
   }
 
+  // Request-priority policy (simplicity/memory pass, 2026-08-26): "foreground
+  // scan > ... > heartbeat" -- see KioskRuntime::network_busy()'s own doc
+  // comment for the gap this closes. Deferring costs nothing here (this
+  // whole call is best-effort telemetry, tried again next cycle) and avoids
+  // two concurrent HTTPClient/WiFiClient instances competing for heap/
+  // sockets when there is no correctness reason for them to overlap.
+  if (runtime_.network_busy()) {
+    kiosk::health::log_structured("INFO", "HEARTBEAT_SKIPPED_BUSY", "heartbeat_client",
+                                  "deferring to an in-flight foreground send");
+    return;
+  }
+
   String url = derive_sibling_endpoint(backend_url, "heartbeat");
   // Cheap, in-memory, no I/O -- safe to build on the calling thread exactly
   // as before. Only the actual network POST below moves to a background

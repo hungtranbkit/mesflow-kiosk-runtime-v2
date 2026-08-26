@@ -113,6 +113,18 @@ class KioskRuntime {
   String last_error_code() const { return last_error_code_.c_str(); }
   uint32_t last_latency_ms() const { return last_latency_ms_; }
   int last_retry_count() const { return last_retry_count_; }
+  // Request-priority policy (simplicity/memory pass, 2026-08-26):
+  // "foreground scan > critical reconnect/bootstrap > offline replay >
+  // heartbeat > background refresh." check_offline_replay() already
+  // deferred to a live send (sender_.busy()||send_retry_pending_) --
+  // HeartbeatClient did NOT, a real gap found auditing this file for that
+  // exact policy: a heartbeat could start its own HTTPClient POST at the
+  // same moment a foreground scan's own send was already in flight, two
+  // concurrent HTTP operations competing for heap/sockets with no
+  // correctness need to. Exposed here so HeartbeatClient::poll() (which
+  // already holds a KioskRuntime& reference) can defer for one cycle
+  // instead.
+  bool network_busy() const { return sender_.busy() || send_retry_pending_; }
   // Network self-recovery (2026-08-26 field report: TCP_CONNECT_FAIL
   // persisting across every send despite WiFi.status()==WL_CONNECTED and
   // the backend verified healthy from elsewhere -- reproduced twice live,
@@ -311,22 +323,38 @@ class KioskRuntime {
   bool env_mismatch_ = false;
   kiosk::protocol::Environment env_mismatch_expected_ = kiosk::protocol::Environment::UNKNOWN;
 
-  // --- Phase 3B real offline replay (2026-08-26, §17/§19) ---
-  // Own COPIES of what needs resending, not raw JournalRecord* -- the
-  // journal's in-memory index can be mutated (new appends, compaction)
-  // across the several poll() cycles a real replay spans, and a dangling
-  // pointer into it would be a real bug. Built once per
-  // start_offline_replay_if_needed() call from
-  // journal_.pending_in_device_seq_order(), which already returns them in
-  // the correct device_seq order.
-  struct ReplayItem {
-    std::string event_id;
-    std::string payload;  // exact original envelope JSON -- resent verbatim, never re-derived
-    uint64_t device_seq = 0;
-  };
-  std::vector<ReplayItem> replay_queue_;
-  size_t replay_next_ = 0;  // index of the next item to send; == replay_queue_.size() means done
+  // --- Phase 3B real offline replay (2026-08-26, §17/§19; memory model
+  // simplified 2026-08-26 "keep the ESP runtime simple and disposable per
+  // request" pass) ---
+  // Only the small event_id strings are queued -- NOT a copy of each
+  // record's payload. The actual JSON envelope is looked up fresh via
+  // journal_.find(event_id) at the exact moment check_offline_replay()
+  // sends it (see that function), never held here across poll() cycles.
+  // This is safe (not the dangling-pointer risk an earlier version of this
+  // comment worried about with a raw JournalRecord*) because PENDING/
+  // IN_FLIGHT records are NEVER removed by compaction (only ACKED/REJECTED
+  // beyond retention are, see EventJournalIndex's own compaction-policy
+  // doc) -- the one item currently at replay_next_ is, by construction,
+  // still exactly one of those two statuses, so find() always succeeds for
+  // it. Total memory here is proportional to the NUMBER of pending events,
+  // never their combined payload size.
+  std::vector<std::string> replay_event_ids_;
+  size_t replay_next_ = 0;  // index of the next item to send; == replay_event_ids_.size() means done
   bool replaying_ = false;  // true while replay_next_'s send is actually in flight
+  // Real gap found live (2026-08-26): start_offline_replay_if_needed() used
+  // to be called ONLY on a boot's first successful bootstrap and on a
+  // WiFi reconnect-count change -- if a business event failed once (a
+  // transient blip) and landed PENDING while the Wi-Fi connection itself
+  // never actually dropped (no reconnect ever happens), that record could
+  // sit unsent INDEFINITELY on an otherwise perfectly healthy connection --
+  // confirmed live: a pending backlog sat un-retried for 89+ seconds with
+  // Wi-Fi connected and the backend independently verified reachable the
+  // whole time. This periodic fallback (independent of both existing
+  // triggers) closes that gap; start_offline_replay_if_needed() is already
+  // a safe no-op when nothing is pending or a replay is already running,
+  // so calling it on a plain timer costs nothing extra in the normal case.
+  unsigned long last_replay_fallback_check_ms_ = 0;
+  static constexpr unsigned long kReplayFallbackCheckIntervalMs = 30000;
 
   void check_offline_replay();
 

@@ -9,6 +9,7 @@
 #include "../health/structured_log.h"
 #include "../protocol/json_extract.h"    // whitespace-tolerant field extraction
 #include "../protocol/protocol_codec.h"  // json_escape
+#include "../protocol/retry_policy.h"    // kResponseTooLargeMarker
 #include "endpoint_utils.h"
 
 namespace kiosk::network {
@@ -78,7 +79,22 @@ BootstrapResult BootstrapClient::attempt(const String& events_url, const String&
   http.addHeader("Content-Type", "application/json");
 
   int status = http.POST(body.c_str());
-  std::string response = status > 0 ? std::string(http.getString().c_str()) : "";
+  // Response-size guard (2026-08-26): see RUNTIME_MAX_RESPONSE_BODY_BYTES'
+  // own doc comment -- reject on Content-Length alone, before ever calling
+  // getString(), rather than let a pathological response allocate an
+  // unbounded String.
+  std::string response;
+  if (status > 0) {
+    int content_length = http.getSize();
+    if (content_length < 0 || content_length > RUNTIME_MAX_RESPONSE_BODY_BYTES) {
+      kiosk::health::log_structured(
+          "ERROR", "BOOTSTRAP_RESPONSE_TOO_LARGE", "bootstrap_client",
+          (std::string("content_length=") + std::to_string(content_length)).c_str());
+      status = kiosk::protocol::kResponseTooLargeMarker;
+    } else {
+      response = std::string(http.getString().c_str());
+    }
+  }
   http.end();
 
   if (status <= 0) {

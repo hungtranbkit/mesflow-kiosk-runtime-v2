@@ -9,6 +9,7 @@
 #include "../config/runtime_config.h"
 #include "../health/memory_diag.h"
 #include "../health/structured_log.h"
+#include "../protocol/retry_policy.h"  // kResponseTooLargeMarker
 
 namespace kiosk::network {
 
@@ -31,10 +32,23 @@ void fetch_task_entry(void* arg) {
 #endif
   if (http.begin(job->url)) {
     int status = http.GET();
-    result.http_status = status;
+    // Response-size guard (2026-08-26): this same code path also serves the
+    // UI bundle download (ui_sync_controller.cpp reuses AsyncStateFetcher),
+    // so RUNTIME_MAX_RESPONSE_BODY_BYTES is sized with real bundle payloads
+    // in mind, not just /state's own small bodies -- see that constant's
+    // own doc comment.
     if (status > 0) {
-      result.response_body = std::string(http.getString().c_str());
+      int content_length = http.getSize();
+      if (content_length < 0 || content_length > RUNTIME_MAX_RESPONSE_BODY_BYTES) {
+        kiosk::health::log_structured(
+            "ERROR", "STATE_SYNC_RESPONSE_TOO_LARGE", "state_client",
+            (std::string("content_length=") + std::to_string(content_length)).c_str());
+        status = kiosk::protocol::kResponseTooLargeMarker;
+      } else {
+        result.response_body = std::string(http.getString().c_str());
+      }
     }
+    result.http_status = status;
     result.ok = status >= 200 && status < 300;
     http.end();
     kiosk::health::log_structured(result.ok ? "INFO" : "WARN", "STATE_SYNC_ATTEMPT", "state_client",
