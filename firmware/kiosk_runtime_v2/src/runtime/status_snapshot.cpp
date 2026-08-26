@@ -82,6 +82,25 @@ std::string build_status_json(kiosk::security::DeviceIdentity& identity,
   json += "\",\"last_ok_uptime_ms\":" + std::to_string(bootstrap.last_result().last_ok_uptime_ms) + "}";
   json += "},";
 
+  // §2/§3/§4 (2026-08-26 UX-hardening pass): server identity/environment,
+  // for the exact real-hardware confirmation loop found necessary the
+  // first time this shipped -- there was no way to see WHY a device
+  // reported UNKNOWN (backend not yet redeployed with the environment
+  // fields vs. a real parsing bug) without this in /debug/device-state.
+  json += "\"server\":{";
+  json += std::string("\"environment\":\"") +
+          kiosk::protocol::environment_to_string(runtime.server_environment()) + "\",";
+  json += "\"version\":\"" + kiosk::protocol::json_escape(runtime.server_version().c_str()) + "\",";
+  json += "\"expected_environment\":\"" +
+          kiosk::protocol::json_escape(runtime.configured_expected_environment().c_str()) + "\",";
+  json += std::string("\"mismatch\":") + (runtime.env_mismatch() ? "true" : "false") + ",";
+  json += "\"last_sync\":" +
+          (runtime.last_sync_iso().length() > 0
+               ? ("\"" + kiosk::protocol::json_escape(runtime.last_sync_iso().c_str()) + "\"")
+               : std::string("null"));
+  json += ",\"offline_queue\":" + std::to_string(runtime.offline_queue_size());
+  json += "},";
+
   // Phase 2 (§44-46): the SERVER-authoritative business state this device
   // is currently rendering, per kiosk::protocol::StateProjection -- never
   // decided locally, only ever what the last-applied server snapshot said.
