@@ -29,6 +29,17 @@ class ConfigStore {
   // looks like a real address (§3). Callers must check for "" explicitly.
   String api_endpoint();
 
+  // 2026-08-26 UX-hardening pass, §3 "Configured Target vs Actual Server":
+  // the operator-declared "which environment should this device be talking
+  // to" -- raw string as typed (e.g. "DEV"/"test"/"Prod"), mapped via
+  // kiosk::protocol::environment_from_config_string() at the call site, not
+  // here (this class is pure storage, no policy). "" (never configured) is
+  // the same deliberate fail-closed default as api_endpoint() above --
+  // maps to Environment::UNKNOWN, which environment_matches() never treats
+  // as a match against anything.
+  String expected_environment();
+  void set_expected_environment(const String& env);
+
   void set_wifi_credentials(const String& ssid, const String& password);
 
   // Validates first (kiosk::protocol::validate_backend_url, host-tested);

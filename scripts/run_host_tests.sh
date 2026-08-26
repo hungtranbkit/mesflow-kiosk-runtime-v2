@@ -59,6 +59,14 @@ for test_src in test/host/test_*.cpp; do
     test_low_memory_supervisor)
       extra_srcs=(firmware/kiosk_runtime_v2/src/health/low_memory_supervisor.cpp)
       ;;
+    test_ui_timeout_policy)
+      extra_srcs=(firmware/kiosk_runtime_v2/src/protocol/state_projection.cpp
+                  firmware/kiosk_runtime_v2/src/protocol/json_extract.cpp
+                  firmware/kiosk_runtime_v2/src/runtime/ui_timeout_policy.cpp)
+      ;;
+    test_environment_label)
+      extra_srcs=(firmware/kiosk_runtime_v2/src/protocol/environment_label.cpp)
+      ;;
   esac
 
   echo "--- $name ---"

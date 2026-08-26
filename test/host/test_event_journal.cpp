@@ -455,6 +455,45 @@ int main() {
     check(idx.should_consider_compaction(), "70.0% usage crosses the WARNING boundary and urges compaction");
   }
 
+  // --- pending_in_device_seq_order() (2026-08-26, Phase 3B real offline
+  // replay, §17/§19) ---
+  {
+    EventJournalIndex idx(100000);
+    JournalRecord acked = make_record("evt-acked", JournalSyncStatus::ACKED);
+    acked.device_seq = 1;
+    idx.record_appended_event(acked, 200);
+    JournalRecord pending_high = make_record("evt-pending-high", JournalSyncStatus::PENDING);
+    pending_high.device_seq = 30;
+    idx.record_appended_event(pending_high, 200);
+    JournalRecord conflict = make_record("evt-conflict", JournalSyncStatus::CONFLICT);
+    conflict.device_seq = 15;
+    idx.record_appended_event(conflict, 200);
+    JournalRecord pending_low = make_record("evt-pending-low", JournalSyncStatus::PENDING);
+    pending_low.device_seq = 5;
+    idx.record_appended_event(pending_low, 200);
+    JournalRecord in_flight = make_record("evt-in-flight", JournalSyncStatus::IN_FLIGHT);
+    in_flight.device_seq = 20;
+    idx.record_appended_event(in_flight, 200);
+    JournalRecord rejected = make_record("evt-rejected", JournalSyncStatus::REJECTED);
+    rejected.device_seq = 2;
+    idx.record_appended_event(rejected, 200);
+    JournalRecord human_review = make_record("evt-human-review", JournalSyncStatus::HUMAN_REVIEW);
+    human_review.device_seq = 3;
+    idx.record_appended_event(human_review, 200);
+
+    std::vector<const JournalRecord*> pending = idx.pending_in_device_seq_order();
+    check(pending.size() == 3, "only PENDING/IN_FLIGHT are selected -- ACKED/REJECTED/CONFLICT/HUMAN_REVIEW excluded");
+    check(pending.size() == 3 && pending[0]->event_id == "evt-pending-low" && pending[0]->device_seq == 5,
+          "lowest device_seq (5) comes first");
+    check(pending.size() == 3 && pending[1]->event_id == "evt-in-flight" && pending[1]->device_seq == 20,
+          "middle device_seq (20) comes second");
+    check(pending.size() == 3 && pending[2]->event_id == "evt-pending-high" && pending[2]->device_seq == 30,
+          "highest device_seq (30) comes last -- original creation order preserved for replay");
+
+    EventJournalIndex empty_idx(1000);
+    check(empty_idx.pending_in_device_seq_order().empty(), "an index with nothing pending returns an empty list");
+  }
+
   std::printf("\n%d failure(s)\n", g_failures);
   return g_failures == 0 ? 0 : 1;
 }

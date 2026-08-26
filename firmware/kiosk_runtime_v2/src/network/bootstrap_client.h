@@ -39,6 +39,15 @@ struct BootstrapResult {
   // (never treated as "matches" by ui_bundle_needs_sync()).
   uint32_t ui_bundle_version = 0;
   String ui_bundle_hash;
+
+  // 2026-08-26 UX-hardening pass, §2/§3: server identity, added to
+  // app/mesflow/web/kiosk_v2.py's /bootstrap response the same day. All
+  // "" if the response predates this field (an older backend) -- callers
+  // must treat "" as UNKNOWN, never assume a match. See
+  // environment_label.h for the DEV/TEST/PROD/UNKNOWN mapping this feeds.
+  String server_environment;  // raw settings.environment, e.g. "test"/"production"/"local_test"
+  String server_role;         // raw settings.server_role, e.g. "DEV"/"PRODUCTION_TEST"/"PRODUCTION"/""
+  String server_version;      // mesflow.__version__, e.g. "71.0.0.70"
 };
 
 // Single attempt, blocking (this runs once at boot, before normal scan

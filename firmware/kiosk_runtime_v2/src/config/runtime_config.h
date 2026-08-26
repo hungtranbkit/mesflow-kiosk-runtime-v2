@@ -114,5 +114,20 @@
 
 // --- Heartbeat (§43/§44) ---
 #define HEARTBEAT_INTERVAL_MS 20000
+
+// --- Task watchdog (2026-08-26 ESP kiosk UX-hardening pass, §21) ---
+// Before this, no esp_task_wdt_* call existed anywhere in this firmware --
+// RecoveryCode::WATCHDOG was a declared-but-never-constructed enum value,
+// and the only stall protection was a 5-minute SOFTWARE UI-stall self-check
+// (kiosk_runtime_v2.ino) that can only ever catch a loop() that is STILL
+// RUNNING but not rendering, never a genuinely hung loop() (e.g. a display
+// SPI transaction blocking forever). This is a REAL hardware backstop for
+// that gap. 15s is comfortably above every legitimate slow path measured on
+// real hardware (the worst known: EventJournal::compact()'s one-shot,
+// non-incremental rewrite path, ~4.2s for 214 records -- only taken on the
+// rare CRITICAL low-memory escalation, see event_journal.h) while still
+// being short enough that an operator isn't left staring at a truly frozen
+// screen for long before the chip resets itself back to boot -> READY.
+#define TASK_WATCHDOG_TIMEOUT_S 15
 // Sequence reservation block size for persistent device_seq (§8, docs/PROTOCOL.md).
 #define DEVICE_SEQ_RESERVE_BLOCK 1000

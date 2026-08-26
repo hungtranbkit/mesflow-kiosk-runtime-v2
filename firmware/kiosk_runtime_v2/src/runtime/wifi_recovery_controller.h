@@ -27,15 +27,21 @@ class WifiRecoveryController {
   // only KioskRuntime/WifiManager know how to actually perform (§4). Wi-Fi
   // setup (portal_.start()) and reboot are handled directly here -- they
   // don't need anything from the caller.
+  // show_device_info: §4 (2026-08-26 UX-hardening pass) -- the recovery
+  // menu's new "6" option. Same callback shape as the other three (this
+  // class must not depend on KioskRuntime's concrete type to gather the
+  // fields a Device Info screen needs).
   WifiRecoveryController(EventBus& bus, kiosk::ui::Renderer& renderer,
                           kiosk::network::WifiSetupPortal& portal, std::function<void()> retry_network,
-                          std::function<void()> resync, std::function<void()> return_to_state)
+                          std::function<void()> resync, std::function<void()> return_to_state,
+                          std::function<void()> show_device_info)
       : bus_(bus),
         renderer_(renderer),
         portal_(portal),
         retry_network_(std::move(retry_network)),
         resync_(std::move(resync)),
-        return_to_state_(std::move(return_to_state)) {}
+        return_to_state_(std::move(return_to_state)),
+        show_device_info_(std::move(show_device_info)) {}
 
   void begin();
 
@@ -57,6 +63,7 @@ class WifiRecoveryController {
   std::function<void()> retry_network_;
   std::function<void()> resync_;
   std::function<void()> return_to_state_;
+  std::function<void()> show_device_info_;
 
   bool star_held_ = false;
   unsigned long star_down_ms_ = 0;
@@ -65,6 +72,11 @@ class WifiRecoveryController {
   // (independent of whether '*' is still held) until a digit selection or
   // the ~10s Wi-Fi-setup threshold is reached by continuing to hold.
   bool menu_active_ = false;
+  // §4: Device Info is shown, not part of the numbered-menu-selection flow
+  // -- any subsequent key returns to the menu (not all the way back to the
+  // business screen), since an operator who opened it from the menu most
+  // likely wants the menu back, not to lose their place entirely.
+  bool device_info_active_ = false;
 
   void enter_menu();
   void exit_menu_to_current_state();

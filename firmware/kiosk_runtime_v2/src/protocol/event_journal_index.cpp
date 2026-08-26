@@ -70,6 +70,19 @@ const JournalRecord* EventJournalIndex::find(const std::string& event_id) const 
   return it == records_.end() ? nullptr : &it->second;
 }
 
+std::vector<const JournalRecord*> EventJournalIndex::pending_in_device_seq_order() const {
+  std::vector<const JournalRecord*> out;
+  for (const auto& kv : records_) {
+    if (kv.second.sync_status == JournalSyncStatus::PENDING ||
+        kv.second.sync_status == JournalSyncStatus::IN_FLIGHT) {
+      out.push_back(&kv.second);
+    }
+  }
+  std::sort(out.begin(), out.end(),
+            [](const JournalRecord* a, const JournalRecord* b) { return a->device_seq < b->device_seq; });
+  return out;
+}
+
 JournalCounts EventJournalIndex::counts() const {
   JournalCounts c;
   for (const auto& kv : records_) {

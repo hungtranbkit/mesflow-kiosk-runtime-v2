@@ -133,6 +133,15 @@ BootstrapResult BootstrapClient::attempt(const String& events_url, const String&
     result.ui_bundle_hash = kiosk::protocol::json_extract_string(desired_obj, "ui_bundle_hash").c_str();
   }
 
+  // §2/§3 of the 2026-08-26 UX-hardening pass: top-level fields, not nested
+  // under desired{}/state{} -- json_extract_string() on the raw response
+  // handles a JSON null (settings.server_role can be None) the same as a
+  // missing key, both come back "" here, which is exactly the honest
+  // "server didn't say" value environment_label.h maps to UNKNOWN.
+  result.server_environment = kiosk::protocol::json_extract_string(response, "environment").c_str();
+  result.server_role = kiosk::protocol::json_extract_string(response, "server_role").c_str();
+  result.server_version = kiosk::protocol::json_extract_string(response, "version").c_str();
+
   kiosk::health::log_structured("INFO", "BOOTSTRAP_OK", "bootstrap_client",
                                  result.device_status.c_str());
 

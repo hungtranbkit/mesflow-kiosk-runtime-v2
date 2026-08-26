@@ -38,6 +38,19 @@ String ConfigStore::api_endpoint() {
   return v;
 }
 
+String ConfigStore::expected_environment() {
+  prefs.begin(kNamespace, true);
+  String v = prefs.getString("expected_env", "");
+  prefs.end();
+  return v;
+}
+
+void ConfigStore::set_expected_environment(const String& env) {
+  prefs.begin(kNamespace, false);
+  prefs.putString("expected_env", env);
+  prefs.end();
+}
+
 void ConfigStore::set_wifi_credentials(const String& ssid, const String& password) {
   prefs.begin(kNamespace, false);
   prefs.putString("wifi_ssid", ssid);

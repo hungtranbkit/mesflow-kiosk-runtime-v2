@@ -2,6 +2,9 @@
 
 #include <Arduino.h>
 
+#include <string>
+#include <vector>
+
 #include "../network/api_client.h"
 #include "../network/bootstrap_client.h"
 #include "../network/state_client.h"
@@ -13,8 +16,10 @@
 #include "../storage/config_store.h"
 #include "../storage/event_journal.h"
 #include "../storage/ui_bundle_store.h"
+#include "../protocol/environment_label.h"
 #include "../ui/renderer.h"
 #include "event_bus.h"
+#include "ui_timeout_policy.h"
 
 namespace kiosk::runtime {
 
@@ -116,6 +121,18 @@ class KioskRuntime {
   int64_t last_server_seq() const { return last_server_seq_; }
   String local_quantity_buffer() const { return local_qty_buffer_.c_str(); }
 
+  // --- Server environment identity (2026-08-26 UX-hardening pass, §2/§3/§4)
+  // -- populated from the LAST successful bootstrap's server_role/
+  // environment/version fields (app/mesflow/web/kiosk_v2.py, added the same
+  // day). UNKNOWN/"" before the first bootstrap this boot ever completes.
+  // Exposed publicly for the Device Info screen and /debug/device-state,
+  // same visibility level as the other boot/identity accessors above.
+  kiosk::protocol::Environment server_environment() const { return server_environment_; }
+  bool env_mismatch() const { return env_mismatch_; }
+  kiosk::protocol::Environment env_mismatch_expected() const { return env_mismatch_expected_; }
+  String server_version() const { return server_version_; }
+  String configured_expected_environment() const { return config_.expected_environment(); }
+
   // Phase 3A durable journal (shadow mode) -- read-only access for
   // /debug/device-state and the heartbeat body (status_snapshot.cpp).
   const kiosk::storage::EventJournal& journal() const { return journal_; }
@@ -135,6 +152,28 @@ class KioskRuntime {
   // "4 RETURN": re-render whatever the CURRENT authoritative state actually
   // is -- reuses refresh_idle_screen() as-is (already public), named here
   // only in this comment for discoverability from the menu's call site.
+
+  // --- Phase 3B real offline replay (2026-08-26 UX-hardening pass, §17/§19)
+  // -- called once by the .ino on every Wi-Fi reconnect (same trigger point
+  // that re-arms bootstrap), NOT a background timer of its own. A no-op if
+  // nothing is PENDING/IN_FLIGHT or a replay is already in progress. See
+  // check_offline_replay()'s own comment for why this reuses the SAME
+  // single sender_/apply_event_response() path live scans use, deliberately
+  // NOT a separate AsyncEventSender/completion handler.
+  void start_offline_replay_if_needed();
+  // Total PENDING+IN_FLIGHT in the durable journal right now -- the real,
+  // persistent backlog size (not just "items left in the current replay
+  // pass", which is 0 between reconnects even if a real backlog exists).
+  // Same value the status bar's "Q:N" already reads every poll().
+  uint32_t offline_queue_size() const {
+    auto c = journal_.counts();
+    return c.pending + c.in_flight;
+  }
+  // §4: last successful server round-trip (bootstrap or event ack), for
+  // Device Info's "Last sync" field. "" if none yet this boot (never
+  // fabricated -- same discipline as EventTimeInfo's own timestamp field).
+  String last_sync_iso() const { return last_sync_iso_.c_str(); }
+  String api_endpoint_value() const { return api_endpoint_; }
 
 #if MESFLOW_DEBUG_API
   // DEV-only fault injection forwarding (§8) -- AsyncEventSender's hook is
@@ -215,8 +254,67 @@ class KioskRuntime {
   uint64_t retry_device_seq_ = 0;
   static constexpr unsigned long kSendRetryDelayMs = 800;
 
+  // --- Central UI inactivity timeout (2026-08-26 ESP kiosk UX-hardening
+  // pass, §13/ui_timeout_policy.h) ---
+  // Reset on ANY real interaction: a scan, an accepted business keypress, or
+  // a server round-trip actually landing (apply_event_response/bootstrap/
+  // resync) -- not merely "time since this business state was entered",
+  // since an operator actively typing a multi-digit quantity must never be
+  // timed out mid-entry (see handle_business_key()'s QUANTITY_INPUT digit
+  // branch, which touches this on every keystroke).
+  unsigned long last_activity_ms_ = 0;
+  // QUANTITY_INPUT's timeout is two-stage (see check_ui_timeout()'s own
+  // comment for why a blind reset/cancel here would be wrong): first firing
+  // only warns and re-arms the clock once; only a SECOND consecutive
+  // timeout falls back to re-rendering the current authoritative state.
+  // Cleared whenever QUANTITY_INPUT is freshly (re-)entered, same lifetime
+  // as qty_step_/qty_good_/qty_defect_ (see reset_quantity_flow()).
+  bool qty_timeout_warned_ = false;
+
+  // --- Server environment identity / mismatch (2026-08-26, §2/§3) ---
+  kiosk::protocol::Environment server_environment_ = kiosk::protocol::Environment::UNKNOWN;
+  String server_version_;
+  std::string last_sync_iso_;  // §4: last successful server round-trip, "" if none yet this boot
+  // §3: env_mismatch_ blocks ALL business input (handle_scan/
+  // handle_business_key both check it, render_current_business_state takes
+  // over the whole screen) but is DELIBERATELY only set when BOTH sides are
+  // known and disagree -- see apply_server_environment()'s own comment for
+  // why a never-configured device (expected_environment=="") must degrade
+  // gracefully rather than hard-block, unlike a genuine cross-environment
+  // mismatch.
+  bool env_mismatch_ = false;
+  kiosk::protocol::Environment env_mismatch_expected_ = kiosk::protocol::Environment::UNKNOWN;
+
+  // --- Phase 3B real offline replay (2026-08-26, §17/§19) ---
+  // Own COPIES of what needs resending, not raw JournalRecord* -- the
+  // journal's in-memory index can be mutated (new appends, compaction)
+  // across the several poll() cycles a real replay spans, and a dangling
+  // pointer into it would be a real bug. Built once per
+  // start_offline_replay_if_needed() call from
+  // journal_.pending_in_device_seq_order(), which already returns them in
+  // the correct device_seq order.
+  struct ReplayItem {
+    std::string event_id;
+    std::string payload;  // exact original envelope JSON -- resent verbatim, never re-derived
+    uint64_t device_seq = 0;
+  };
+  std::vector<ReplayItem> replay_queue_;
+  size_t replay_next_ = 0;  // index of the next item to send; == replay_queue_.size() means done
+  bool replaying_ = false;  // true while replay_next_'s send is actually in flight
+
+  void check_offline_replay();
+
+  // Computes the mismatch decision from the given bootstrap result's raw
+  // server_role/environment/version fields and this device's configured
+  // expected_environment, updating server_environment_/server_version_/
+  // env_mismatch_*. Returns true if it's now safe to apply a business-state
+  // snapshot (no mismatch), false if the caller must NOT apply one (a real
+  // mismatch was just detected).
+  bool apply_server_environment(const kiosk::network::BootstrapResult& result);
+
   void check_error_view_timeout();
   void check_send_retry();
+  void check_ui_timeout();
 
   void handle_scan(const String& raw_code, unsigned long timestamp_ms);
   void handle_business_key(char key);

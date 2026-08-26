@@ -16,6 +16,24 @@ constexpr uint16_t kColorAccent = ILI9341_GREEN;
 constexpr uint16_t kColorWarn = ILI9341_YELLOW;
 constexpr uint16_t kColorMuted = 0x9517;  // #94A3B8, matches the bundle palette's own muted tone
 constexpr uint16_t kColorErr = 0xF1EB;    // #F43F5E, matches the bundle palette's own error/critical tone
+// §25 (2026-08-26 UX-hardening pass): DEV's fixed environment color --
+// #60A5FA (Tailwind blue-400), same hex-computed-RGB565 style as
+// kColorMuted/kColorErr above. TEST reuses kColorWarn (amber/yellow), PROD
+// reuses kColorAccent (green), UNKNOWN/OFFLINE/ERROR reuse kColorMuted/
+// kColorErr -- §25 is explicit that color is never the ONLY signal, so
+// reusing existing named colors for those is correct, not a shortcut.
+constexpr uint16_t kColorDev = 0x653F;
+
+uint16_t environment_color(kiosk::protocol::Environment e) {
+  using kiosk::protocol::Environment;
+  switch (e) {
+    case Environment::DEV: return kColorDev;
+    case Environment::TEST: return kColorWarn;
+    case Environment::PROD: return kColorAccent;
+    case Environment::UNKNOWN: return kColorMuted;
+  }
+  return kColorMuted;
+}
 
 // ==========================================================================
 // Design system (2026-08-25 UI consistency cleanup). See docs/KIOSK_UI_GUIDE.md
@@ -286,6 +304,32 @@ void Renderer::emit_component_text(int16_t x, int16_t y, const String& text, uin
 // ==========================================================================
 
 void Renderer::draw_status_bar(WifiIndicator wifi) {
+  // §2/§6/§25 (2026-08-26 UX-hardening pass): environment label, far-left
+  // of the header -- the one thing every main screen must always show
+  // (§2: "Không dùng mỗi IP làm dấu hiệu environment"; §25: color is never
+  // the only signal, so the text itself is what actually satisfies this,
+  // the color is reinforcement). OFFLINE gets its own dedicated red text
+  // appended right after the label when disconnected, matching §6's
+  // "TEST · OFFLINE" example exactly rather than relying on the signal-bar
+  // icon alone to say so.
+  {
+    String env_text = kiosk::protocol::environment_to_string(current_environment_);
+    emit_component_text(kSpacingSmall, kSpacingSmall, env_text, environment_color(current_environment_),
+                        kFontSmall);
+    int16_t next_x = kSpacingSmall + static_cast<int>(measure_text_width(env_text, kFontSmall));
+    if (wifi == WifiIndicator::DISCONNECTED) {
+      String offline_text = " OFFLINE";
+      emit_component_text(next_x, kSpacingSmall, offline_text, kColorErr, kFontSmall);
+      next_x += static_cast<int>(measure_text_width(offline_text, kFontSmall));
+    }
+    // §6/§18: "Q:N" only while a real offline backlog exists -- never a
+    // permanent "Q:0" a healthy device would otherwise always show.
+    if (offline_queue_size_ > 0) {
+      String queue_text = " Q:" + String(offline_queue_size_);
+      emit_component_text(next_x, kSpacingSmall, queue_text, kColorWarn, kFontSmall);
+    }
+  }
+
   // Graphical signal-bar icon, top-right corner. Three bars of increasing
   // height, filled = on. This WifiIndicator enum has no per-dBm signal data
   // (unlike legacy's RSSI-driven bar count), so it's a coarse approximation:
@@ -572,6 +616,60 @@ void Renderer::draw_safe_mode_screen(const String& reason_code, WifiIndicator wi
   end_screen();
 }
 
+void Renderer::draw_server_mismatch_screen(kiosk::protocol::Environment expected,
+                                           kiosk::protocol::Environment actual, WifiIndicator wifi) {
+  begin_screen("server_mismatch");
+  draw_title_line("SAI MÔI TRƯỜNG", 60, kColorErr);
+  emit_component_text(centered_x("Cần:", kFontSmall), 120, "Cần:", kColorMuted, kFontSmall);
+  String expected_label = kiosk::protocol::environment_to_string(expected);
+  emit_component_text(centered_x(expected_label, kFontLarge), 140, expected_label.c_str(),
+                      environment_color(expected), kFontLarge);
+  emit_component_text(centered_x("Hiện tại:", kFontSmall), 180, "Hiện tại:", kColorMuted, kFontSmall);
+  String actual_label = kiosk::protocol::environment_to_string(actual);
+  emit_component_text(centered_x(actual_label, kFontLarge), 200, actual_label.c_str(),
+                      environment_color(actual), kFontLarge);
+  emit_component_text(centered_x("KHÔNG CHO PHÉP THAO TÁC", kFontSmall), 250, "KHÔNG CHO PHÉP THAO TÁC",
+                      kColorErr, kFontSmall);
+  // Deliberately NO footer hint -- there is no key/action a normal operator
+  // should take here (§3: this is a configuration/infrastructure problem,
+  // not something to work around from the kiosk). Device Info (recovery
+  // menu) still shows the same expected/actual pair for whoever IS meant
+  // to fix it.
+  draw_status_bar(wifi);
+  end_screen();
+}
+
+void Renderer::draw_device_info_screen(kiosk::protocol::Environment environment, const String& server_endpoint,
+                                       const String& server_version, const String& device_id,
+                                       const String& hardware_id, const String& firmware_version,
+                                       const String& wifi_ssid, const String& wifi_ip, int wifi_rssi,
+                                       bool api_online, const String& last_sync_iso, uint32_t offline_queue,
+                                       WifiIndicator wifi) {
+  begin_screen("device_info");
+  constexpr int16_t kLabelX = 8;
+  int16_t y = kContentTop + kSpacingSmall;
+  auto row = [&](const String& label, const String& value, uint16_t value_color) {
+    String line = label + value;
+    emit_component_text(kLabelX, y, line, value_color, kFontSmall);
+    y += kLineHeightSmall;
+  };
+  row("Env      : ", kiosk::protocol::environment_to_string(environment), environment_color(environment));
+  row("Server   : ", server_endpoint.length() > 0 ? server_endpoint : String("(chưa cấu hình)"), kColorFg);
+  row("Ver      : ", server_version.length() > 0 ? server_version : String("?"), kColorMuted);
+  row("Device ID: ", device_id.length() > 0 ? device_id : String("(chưa provision)"), kColorFg);
+  row("HW ID    : ", hardware_id, kColorMuted);
+  row("Firmware : ", firmware_version, kColorMuted);
+  row("WiFi     : ", wifi_ssid.length() > 0 ? wifi_ssid : String("--"), kColorFg);
+  row("IP       : ", wifi_ip.length() > 0 ? wifi_ip : String("--"), kColorMuted);
+  row("RSSI     : ", wifi_rssi != 0 ? (String(wifi_rssi) + " dBm") : String("--"), kColorMuted);
+  row("API      : ", api_online ? String("ONLINE") : String("OFFLINE"), api_online ? kColorAccent : kColorErr);
+  row("Last sync: ", last_sync_iso.length() > 0 ? last_sync_iso : String("(chưa)"), kColorMuted);
+  row("Offline Q: ", String(offline_queue), offline_queue > 0 ? kColorWarn : kColorMuted);
+  draw_footer("bất kỳ phím", "quay lại");
+  draw_status_bar(wifi);
+  end_screen();
+}
+
 void Renderer::draw_recovery_menu(WifiIndicator wifi) {
   begin_screen("recovery_menu");
   emit_component_text(centered_x("MENU KHÔI PHỤC", kFontLarge), 40, "MENU KHÔI PHỤC", kColorAccent,
@@ -581,8 +679,8 @@ void Renderer::draw_recovery_menu(WifiIndicator wifi) {
   constexpr int16_t kMenuX = 24;
   constexpr int16_t kMenuY0 = 110;
   const char* items[] = {"1  Thử lại mạng", "2  Đồng bộ lại", "3  Cài đặt Wi-Fi", "4  Quay lại",
-                         "5  Khởi động lại"};
-  for (int i = 0; i < 5; ++i) {
+                         "5  Khởi động lại", "6  Thông tin thiết bị"};
+  for (int i = 0; i < 6; ++i) {
     emit_component_text(kMenuX, kMenuY0 + i * kLineHeightSmall, items[i], kColorFg, kFontSmall);
   }
   draw_footer("* giữ lâu hơn:", "Wi-Fi");
@@ -641,6 +739,13 @@ void Renderer::draw_business_state(const kiosk::protocol::StateSnapshot& s,
       draw_fit_text(s.view.has_employee_name ? String(s.view.employee_name.c_str()) : String("(nhân viên)"),
                    64, kColorAccent, /*prefer_large=*/false);
       draw_title_2line("QUÉT MÃ", "CÔNG ĐOẠN", 150, kColorFg);
+      // §7/§12 (2026-08-26 UX-hardening pass): this state previously had no
+      // way out short of the '*'-hold Wi-Fi-recovery menu -- '#' now sends
+      // CANCEL_REQUESTED (kiosk_runtime.cpp::handle_business_key), and the
+      // same key/timeout also fires this automatically after
+      // ui_timeout_policy.h's WAIT_OPERATION window if the operator walks
+      // away mid-scan.
+      draw_footer("", "# Hủy");
       break;
 
     case BusinessState::SESSION_ACTIVE: {

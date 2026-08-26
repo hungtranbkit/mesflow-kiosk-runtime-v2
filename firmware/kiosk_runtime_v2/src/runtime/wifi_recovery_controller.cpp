@@ -73,8 +73,19 @@ void WifiRecoveryController::handle_menu_selection(char key) {
       delay(100);
       ESP.restart();
       break;
+    case '6':
+      // §4: Device Info -- stays under the recovery-overlay umbrella
+      // (menu_active_ off, device_info_active_ on) so KioskRuntime's own
+      // key handling keeps ignoring keypad input the whole time this is
+      // shown, same protection the menu itself already has.
+      kiosk::health::log_structured("INFO", "RECOVERY_MENU_SELECT", "wifi_recovery_controller",
+                                    "6 DEVICE INFO");
+      menu_active_ = false;
+      device_info_active_ = true;
+      if (show_device_info_) show_device_info_();
+      break;
     default:
-      break;  // not one of the 5 options -- ignore, stay in the menu
+      break;  // not one of the 6 options -- ignore, stay in the menu
   }
 }
 
@@ -113,9 +124,20 @@ void WifiRecoveryController::handle_local_event(const LocalEvent& event) {
     return;
   }
 
-  // §4/§5: while the menu is open, digit keys 1-5 are menu selections, not
+  // §4: while Device Info is shown, ANY key returns to the menu (not a
+  // specific selection -- there's nothing to choose here, just a way out,
+  // per §12 "cancel everywhere"). Checked before the menu-selection block
+  // below since device_info_active_ and menu_active_ are never both true.
+  if (device_info_active_ && (event.kind == LocalEventKind::KEY_DOWN)) {
+    device_info_active_ = false;
+    menu_active_ = true;
+    renderer_.draw_recovery_menu(wifi_indicator_);
+    return;
+  }
+
+  // §4/§5: while the menu is open, digit keys 1-6 are menu selections, not
   // business input -- must be checked BEFORE the '*'-only filter below.
-  if (menu_active_ && event.kind == LocalEventKind::KEY_DOWN && event.key >= '1' && event.key <= '5') {
+  if (menu_active_ && event.kind == LocalEventKind::KEY_DOWN && event.key >= '1' && event.key <= '6') {
     handle_menu_selection(event.key);
     return;
   }

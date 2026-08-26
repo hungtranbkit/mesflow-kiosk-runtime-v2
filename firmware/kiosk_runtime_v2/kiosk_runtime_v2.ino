@@ -12,6 +12,7 @@
 #include <freertos/task.h>
 
 #include <esp_heap_caps.h>
+#include <esp_task_wdt.h>
 
 #include "src/config/hardware_pins.h"
 #include "src/debug/debug_server.h"
@@ -79,7 +80,31 @@ kiosk::runtime::UiSyncController g_ui_sync(g_ui_bundle_store);
 // option, long after both are fully set up.
 kiosk::runtime::WifiRecoveryController g_wifi_recovery(
     g_bus, g_renderer, g_wifi_portal, [] { g_wifi.retry_now(); },
-    [] { g_runtime.request_manual_resync(); }, [] { g_runtime.refresh_idle_screen(); });
+    [] { g_runtime.request_manual_resync(); }, [] { g_runtime.refresh_idle_screen(); },
+    [] {
+      // §4 (2026-08-26 UX-hardening pass): gathered here, not inside
+      // WifiRecoveryController, so that class stays independent of
+      // KioskRuntime's/WiFi's concrete types (same reasoning as its other
+      // 3 callbacks) -- everything needed is already in scope in this file.
+      bool online = g_wifi.state() == kiosk::network::WifiState::CONNECTED;
+      // Inlined rather than calling current_wifi_indicator() -- that helper
+      // is declared further down this same anonymous namespace, after this
+      // lambda is parsed (this object's initializer runs at static-init
+      // time, but the LAMBDA BODY itself must still name only symbols
+      // already visible at the point it's written).
+      kiosk::ui::WifiIndicator wifi_ind = kiosk::ui::WifiIndicator::UNKNOWN;
+      switch (g_wifi.state()) {
+        case kiosk::network::WifiState::CONNECTED: wifi_ind = kiosk::ui::WifiIndicator::CONNECTED; break;
+        case kiosk::network::WifiState::CONNECTING: wifi_ind = kiosk::ui::WifiIndicator::CONNECTING; break;
+        case kiosk::network::WifiState::DISCONNECTED: wifi_ind = kiosk::ui::WifiIndicator::DISCONNECTED; break;
+      }
+      g_renderer.draw_device_info_screen(
+          g_runtime.server_environment(), g_runtime.api_endpoint_value(), g_runtime.server_version(),
+          g_runtime.device_id(), g_runtime.hardware_id(), String(KIOSK_RUNTIME_VERSION),
+          online ? WiFi.SSID() : String(""), online ? WiFi.localIP().toString() : String(""),
+          online ? WiFi.RSSI() : 0, online, g_runtime.last_sync_iso(), g_runtime.offline_queue_size(),
+          wifi_ind);
+    });
 kiosk::network::BootstrapClient g_bootstrap;
 
 kiosk::hardware::SelfTestResult g_selftest;
@@ -152,6 +177,19 @@ constexpr unsigned long kBootstrapRetryCooldownMs = 3000;
 int g_bootstrap_attempt_count = 0;
 unsigned long g_bootstrap_next_attempt_ms = 0;
 
+// §19 of the 2026-08-26 UX-hardening pass: real confirmed gap found reading
+// this file -- g_bootstrap_attempted was NEVER reset anywhere after boot,
+// so a later Wi-Fi drop+reconnect resumed sending events/heartbeats against
+// whatever state_projection_/UI-bundle-version was last established at
+// BOOT time, never re-verifying anything (environment/version, once Phase
+// 2 lands; UI-bundle desired version; the state snapshot itself) until a
+// full manual reboot. g_wifi.reconnect_count() (already existed, added
+// 2026-08-25 for net-diag) increments on every CONNECTED-after-drop
+// transition -- tracking it here and re-arming the exact same
+// once-per-"boot" bootstrap machinery on change re-triggers a real
+// bootstrap/resync/ui-bundle-check with zero new plumbing.
+uint32_t g_last_seen_reconnect_count = 0;
+
 void keypad_calibration_prompt(char key, uint8_t index, uint8_t total) {
   g_renderer.draw_keypad_calibration_prompt(key, index, total);
 }
@@ -183,6 +221,7 @@ void setup() {
   // could itself crash on. PROD+DEV both (this is a safety feature, not a
   // debug tool).
   kiosk::health::recovery_supervisor_init();
+
 
   g_config.init();
   g_identity.init();
@@ -291,6 +330,45 @@ void setup() {
   // WifiSetupPortal::start() sets WIFI_AP_STA itself.
   if (g_config.wifi_ssid().length() == 0) {
     g_wifi_portal.start("no_credentials");
+  }
+
+  // §21 of the 2026-08-26 UX-hardening pass: a REAL hardware watchdog on
+  // loopTask, fed once per loop() iteration below. Registered at the very
+  // END of setup(), not the start -- a REAL bug found live flashing this to
+  // the actual board: registering it early (before journal recovery/
+  // hardware init/the boot-screen hold, which together routinely take
+  // 8-10+ seconds one-time at boot) with feeding only happening in loop()
+  // meant setup() itself never got to finish before the watchdog fired,
+  // panic-crash-looping the device forever on every single boot. Boot's
+  // one-time slow work is fully bounded on its own already (SPIFFS
+  // recovery/hardware init/WIFI_CONNECT_TIMEOUT_MS's async connect, none of
+  // which can hang indefinitely) -- the watchdog's real job is catching a
+  // STEADY-STATE loop() that stops iterating, which this still does.
+  // trigger_panic=true so a timeout resets the chip (visible next boot as
+  // reset_reason=TASK_WDT/PANIC via the EXISTING boot_diagnostics.cpp
+  // reset-reason reporting -- no separate "wire it into RecoveryCode" step
+  // needed, since that taxonomy is for firmware-REQUESTED controlled
+  // reboots, not an async hardware reset this code isn't running to log
+  // during). idle_core_mask=0: only loopTask itself is subscribed
+  // (esp_task_wdt_add(NULL) below) -- the idle tasks are Arduino core's own
+  // concern, not this firmware's.
+  {
+    esp_task_wdt_config_t wdt_config = {};
+    wdt_config.timeout_ms = TASK_WATCHDOG_TIMEOUT_S * 1000;
+    wdt_config.idle_core_mask = 0;
+    wdt_config.trigger_panic = true;
+    esp_err_t wdt_err = esp_task_wdt_init(&wdt_config);
+    if (wdt_err == ESP_ERR_INVALID_STATE) {
+      // Arduino core's own startup already initialized the TWDT (a common
+      // IDF5-based arduino-esp32 default, watching idle tasks only) --
+      // reconfigure it to our own values/scope instead of treating this as
+      // a failure.
+      wdt_err = esp_task_wdt_reconfigure(&wdt_config);
+    }
+    esp_err_t add_err = esp_task_wdt_add(NULL);  // NULL = current task (loopTask, since setup() runs on it)
+    Serial.printf("{\"level\":\"%s\",\"code\":\"WATCHDOG_INIT\",\"timeout_s\":%d,\"init_err\":%d,\"add_err\":%d}\n",
+                  (wdt_err == ESP_OK && add_err == ESP_OK) ? "INFO" : "WARN", TASK_WATCHDOG_TIMEOUT_S,
+                  static_cast<int>(wdt_err), static_cast<int>(add_err));
   }
 }
 
@@ -405,6 +483,27 @@ void poll_serial_provisioning() {
           delay(200);
           ESP.restart();
         }
+      } else if (line.startsWith("expected-env:")) {
+        // §3 of the 2026-08-26 UX-hardening pass: operator-declared "which
+        // environment should this device be talking to" -- compared against
+        // the backend's own real server_role on every bootstrap
+        // (KioskRuntime::apply_server_environment()). Accepts any string
+        // (validated/mapped case-insensitively at comparison time via
+        // kiosk::protocol::environment_from_config_string(); an unrecognized
+        // value just maps to UNKNOWN, same "fail closed, don't hard-block a
+        // typo silently" posture as everywhere else in this file) --
+        // deliberately not rejecting here the way api-endpoint: does, since
+        // there's no real backend round-trip to validate against, just a
+        // local label.
+        String env = line.substring(13);
+        env.trim();
+        g_config.set_expected_environment(env);
+        Serial.printf("{\"level\":\"INFO\",\"code\":\"CONFIG_EXPECTED_ENV_SET\","
+                      "\"module\":\"provisioning\",\"expected_environment\":\"%s\"}\n",
+                      env.c_str());
+        Serial.println("Rebooting to apply expected_environment...");
+        delay(200);
+        ESP.restart();
       } else if (line.startsWith("provision:")) {
         String new_id = line.substring(10);
         new_id.trim();
@@ -680,6 +779,7 @@ void poll_serial_provisioning() {
 }  // namespace
 
 void loop() {
+  esp_task_wdt_reset();  // §21: feed the real hardware watchdog every iteration -- see setup()'s init comment
   g_scanner.poll();
   g_keypad.poll();
   g_wifi_recovery.tick();
@@ -696,6 +796,26 @@ void loop() {
 #endif
 
   if (g_wifi.state() == kiosk::network::WifiState::CONNECTED) {
+    // §19: a reconnect (not the first-ever connect this boot) re-arms the
+    // same bootstrap/ui-bundle-check machinery boot uses -- see
+    // g_last_seen_reconnect_count's own comment above for why this was a
+    // real gap.
+    uint32_t reconnects = g_wifi.reconnect_count();
+    if (reconnects != g_last_seen_reconnect_count) {
+      g_last_seen_reconnect_count = reconnects;
+      g_bootstrap_attempted = false;
+      g_bootstrap_attempt_count = 0;
+      g_bootstrap_next_attempt_ms = 0;
+      kiosk::health::log_structured(
+          "INFO", "NET_WIFI_RECONNECT_REBOOTSTRAP", "kiosk_runtime_v2",
+          (std::string("reconnect_count=") + std::to_string(reconnects) +
+           " -- re-arming bootstrap/ui-bundle-check")
+              .c_str());
+      // §17/§19: a reconnect is also exactly when a real offline backlog
+      // (if any accumulated during the outage) should start draining.
+      g_runtime.start_offline_replay_if_needed();
+    }
+
     if (!g_time_sync_started) {
       g_time_sync_started = true;
       g_time_sync.begin();
@@ -734,6 +854,13 @@ void loop() {
       // invariant 15, the device never restores a business state locally
       // across reboot, it always starts from server authority this boot.
       g_runtime.on_bootstrap_result(bootstrap_result);
+      // §17/§19: also the FIRST-boot equivalent of the reconnect trigger
+      // above -- the durable journal persists across reboots by design, so
+      // a fresh boot can easily start with a real PENDING backlog from
+      // before a crash/power-loss, not only from a mid-session Wi-Fi drop.
+      if (bootstrap_result.status == kiosk::network::BootstrapStatus::OK) {
+        g_runtime.start_offline_replay_if_needed();
+      }
       // Phase 4: check whether the server wants a different UI bundle than
       // whatever's currently active -- read once at boot (heartbeat could
       // also carry this for faster propagation without a reboot; not

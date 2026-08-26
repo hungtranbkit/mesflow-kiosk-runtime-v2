@@ -65,6 +65,21 @@ class EventJournalIndex {
   bool has_event(const std::string& event_id) const { return records_.count(event_id) > 0; }
   const JournalRecord* find(const std::string& event_id) const;
 
+  // Phase 3B (2026-08-26 ESP kiosk UX-hardening pass, §17/§19 "real offline
+  // replay"): the records a reconnect-driven replay should resend, in the
+  // order they were originally created. Only PENDING/IN_FLIGHT qualify --
+  // deliberately NOT ACKED (already succeeded, nothing to do), REJECTED
+  // (the server already gave a final business answer, resending would be
+  // pointless -- app/mesflow/web/kiosk_v2.py's idempotency cache would just
+  // hand back the same rejection), or CONFLICT/HUMAN_REVIEW (both need a
+  // resync/human decision first, not a blind resend -- same distinction
+  // the compaction policy's own "always keep unsynced" already draws
+  // between these six statuses). Sorted by device_seq (not map/event_id
+  // order) so replay preserves the same happens-before ordering the events
+  // were originally created in -- device_seq, not wall-clock time, is this
+  // whole protocol's ordering authority (docs/PROTOCOL.md).
+  std::vector<const JournalRecord*> pending_in_device_seq_order() const;
+
   // --- Compaction (2026-08-24, self-recovery task) ---
   // Real, live problem this fixes: the in-memory index kept EVERY record
   // ever appended forever (records_ never shrank), and on-disk usage grew

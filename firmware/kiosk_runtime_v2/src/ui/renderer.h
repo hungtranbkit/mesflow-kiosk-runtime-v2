@@ -3,6 +3,7 @@
 #include <Arduino.h>
 
 #include "../hardware/display.h"
+#include "../protocol/environment_label.h"  // Environment -- see draw_server_mismatch_screen
 #include "../protocol/state_projection.h"  // StateSnapshot/ViewModel -- see draw_business_state
 #include "../protocol/ui_bundle.h"         // UiScreen -- see draw_from_bundle
 #include "../runtime/boot_diagnostics.h"
@@ -80,13 +81,50 @@ class Renderer {
   // render_current_business_state()) -- reason_code is whatever
   // kiosk::health::safe_mode_reason() returned (a RecoveryCode string, e.g.
   // "RECOVERY_TASK_CREATE_FAILED"), "" if none persisted.
+  // §2/§6/§25 (2026-08-26 UX-hardening pass): the environment label every
+  // main screen's status bar shows. Set once by KioskRuntime whenever a
+  // bootstrap resolves it (apply_server_environment()) and read internally
+  // by draw_status_bar() on every subsequent render -- deliberately NOT a
+  // parameter threaded through all 16 existing draw_status_bar() call
+  // sites (every screen function already calls it); this is the same
+  // "cache it as a member, drawn implicitly" shape wifi_indicator_ already
+  // uses one layer up in KioskRuntime.
+  void set_current_environment(kiosk::protocol::Environment env) { current_environment_ = env; }
+
+  // §6/§18 (2026-08-26 UX-hardening pass): offline queue count, same
+  // cache-as-member/read-implicitly shape as set_current_environment()
+  // above. 0 means "nothing pending" -- draw_status_bar() only shows the
+  // "Q:N" suffix when this is nonzero, so a healthy device's status bar
+  // never grows a permanent "Q:0" nobody needs to see.
+  void set_offline_queue_size(uint32_t n) { offline_queue_size_ = n; }
+
   void draw_safe_mode_screen(const String& reason_code, WifiIndicator wifi);
+
+  // §3 (2026-08-26 UX-hardening pass): takes over the whole screen, same
+  // precedence as SAFE_MODE -- see kiosk_runtime.cpp's
+  // render_current_business_state() for why. No footer/dismiss action is
+  // offered on purpose (§3: must not silently resume); it only clears when
+  // KioskRuntime's own apply_server_environment() sees a later bootstrap
+  // that no longer disagrees.
+  void draw_server_mismatch_screen(kiosk::protocol::Environment expected, kiosk::protocol::Environment actual,
+                                   WifiIndicator wifi);
 
   // §4: the local recovery menu opened by holding '*' ~5s
   // (WifiRecoveryController). Fixed 5 options, no submenu, no per-item
   // dynamic content beyond the header -- deliberately simple per the task's
   // own "keep it simple, no fancy layout work".
   void draw_recovery_menu(WifiIndicator wifi);
+
+  // §4 (2026-08-26 UX-hardening pass): Device Info screen, reachable from
+  // the recovery menu's new "6" option. Pure data display -- no secrets/
+  // tokens among these params (§4's explicit rule; the caller must never
+  // pass one). "" for any not-yet-known string field (never fabricated),
+  // rssi=0/offline_queue=0 are real, honest zero values, not sentinels.
+  void draw_device_info_screen(kiosk::protocol::Environment environment, const String& server_endpoint,
+                               const String& server_version, const String& device_id,
+                               const String& hardware_id, const String& firmware_version,
+                               const String& wifi_ssid, const String& wifi_ip, int wifi_rssi, bool api_online,
+                               const String& last_sync_iso, uint32_t offline_queue, WifiIndicator wifi);
 
   // --- Device identity / provisioning (§5/§36) ---
   // Shown as the persistent idle screen whenever provisioning_state is not
@@ -232,6 +270,8 @@ class Renderer {
   DrawnComponent components_[kMaxComponents];
   int next_component_ = 0;
   bool qa_active_ = false;
+  kiosk::protocol::Environment current_environment_ = kiosk::protocol::Environment::UNKNOWN;
+  uint32_t offline_queue_size_ = 0;
 
   // Draws a one-line Wi-Fi indicator at a fixed bottom row. Shared by every
   // "normal" screen so it's always visible, not something the operator has

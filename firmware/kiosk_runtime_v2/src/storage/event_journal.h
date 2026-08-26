@@ -46,6 +46,11 @@ class EventJournal {
   bool has_event(const std::string& event_id) const { return index_.has_event(event_id); }
   const kiosk::protocol::JournalRecord* find(const std::string& event_id) const { return index_.find(event_id); }
 
+  // Phase 3B (2026-08-26, §17/§19) -- see EventJournalIndex's own comment.
+  std::vector<const kiosk::protocol::JournalRecord*> pending_in_device_seq_order() const {
+    return index_.pending_in_device_seq_order();
+  }
+
   // --- Compaction (2026-08-24, self-recovery task) ---
   // Rewrites /journal.dat to contain only what
   // EventJournalIndex::select_records_to_keep() says should survive (see

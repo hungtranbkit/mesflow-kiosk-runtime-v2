@@ -65,8 +65,60 @@ void KioskRuntime::refresh_idle_screen() {
 #endif
 }
 
+// §2/§3 of the 2026-08-26 UX-hardening pass: real, confirmed gap -- before
+// this, the device had no concept of "which environment am I talking to" at
+// all, so it could never detect a mismatch (e.g. a TEST-configured kiosk
+// accidentally pointed at PRODUCTION via a fat-fingered api-endpoint).
+//
+// Deliberately asymmetric: expected_environment()=="" (device never
+// provisioned with one -- true for every device already in the field
+// before this firmware update) does NOT hard-block. Blocking every
+// already-deployed kiosk the instant this firmware lands, until someone
+// physically visits each one to run `expected-env:<X>`, would be exactly
+// the harsh "firmware update bricks the floor" regression this whole task
+// exists to avoid ("ESP khó update ngoài xưởng"). Only a device that HAS
+// been told what to expect, and gets a DIFFERENT real answer from the
+// server, is blocked -- that is the one case with a genuine safety
+// consequence (operating against the wrong environment's real data).
+bool KioskRuntime::apply_server_environment(const kiosk::network::BootstrapResult& result) {
+  using kiosk::protocol::Environment;
+  using kiosk::protocol::environment_from_config_string;
+  using kiosk::protocol::environment_from_server_role;
+
+  server_environment_ = environment_from_server_role(result.server_role.c_str());
+  server_version_ = result.server_version;
+  renderer_.set_current_environment(server_environment_);  // §2/§6: status bar reads this on every render
+
+  Environment expected = environment_from_config_string(config_.expected_environment().c_str());
+  bool genuine_mismatch =
+      expected != Environment::UNKNOWN && server_environment_ != Environment::UNKNOWN && expected != server_environment_;
+
+  if (genuine_mismatch) {
+    env_mismatch_ = true;
+    env_mismatch_expected_ = expected;
+    kiosk::health::log_structured(
+        "ERROR", "SERVER_ENV_MISMATCH", "kiosk_runtime",
+        (std::string("expected=") + kiosk::protocol::environment_to_string(expected) +
+         " actual=" + kiosk::protocol::environment_to_string(server_environment_))
+            .c_str());
+    render_current_business_state();  // takes over the whole screen -- see the env_mismatch_ check at its top
+    return false;
+  }
+
+  if (env_mismatch_) {
+    // Was mismatched, now resolved (config fixed, or now pointed at the
+    // right server) -- clear it and fall through to a normal render.
+    kiosk::health::log_structured("INFO", "SERVER_ENV_MISMATCH_RESOLVED", "kiosk_runtime", "");
+  }
+  env_mismatch_ = false;
+  last_sync_iso_ = time_sync_.iso8601_now().c_str();  // §4: a successful bootstrap counts as a sync
+  return true;
+}
+
 void KioskRuntime::on_bootstrap_result(const kiosk::network::BootstrapResult& result) {
   if (result.status != kiosk::network::BootstrapStatus::OK) return;
+
+  if (!apply_server_environment(result)) return;  // §3: mismatch -- never apply a snapshot, never proceed
 
   if (!result.has_snapshot) {
     kiosk::health::log_structured("WARN", "STATE_SYNC_FAIL", "kiosk_runtime",
@@ -84,6 +136,7 @@ void KioskRuntime::on_bootstrap_result(const kiosk::network::BootstrapResult& re
 
   if (apply_result == kiosk::protocol::ApplyResult::APPLIED ||
       apply_result == kiosk::protocol::ApplyResult::APPLIED_IDENTICAL) {
+    last_activity_ms_ = millis();  // §13: a fresh snapshot this boot starts the idle clock now, not at millis()==0
     refresh_idle_screen();
   }
   // else (STALE/INCONSISTENT/UNSUPPORTED): a bootstrap snapshot failing to
@@ -115,6 +168,22 @@ void KioskRuntime::render_current_business_state(const String& transient_message
   // act, so there is nothing for those screens to show anyway).
   if (kiosk::health::is_safe_mode()) {
     renderer_.draw_safe_mode_screen(kiosk::health::safe_mode_reason(), wifi_indicator_);
+    return;
+  }
+
+  // §3 of the 2026-08-26 UX-hardening pass: a genuine environment mismatch
+  // takes over the WHOLE screen, same precedence as SAFE_MODE above it --
+  // no business flow renders while this is true (handle_scan()/
+  // handle_business_key() independently refuse to act, matching how
+  // SAFE_MODE's own refusal is structured). Deliberately has NO auto-
+  // dismiss timeout (§3: "KHÔNG CHO PHÉP THAO TÁC" must not silently
+  // resume) -- it only clears via apply_server_environment() on a LATER
+  // successful bootstrap that no longer disagrees (fixed config, or now
+  // pointed at the right server), which keeps running in the background on
+  // every reconnect/retry per §28's "even blocked state must continue
+  // background connectivity checks".
+  if (env_mismatch_) {
+    renderer_.draw_server_mismatch_screen(env_mismatch_expected_, server_environment_, wifi_indicator_);
     return;
   }
 
@@ -214,6 +283,81 @@ String KioskRuntime::state_endpoint_url() const {
   return base + "?device_id=" + device_id_;
 }
 
+// §17/§19 of the 2026-08-26 UX-hardening pass: real, active offline replay
+// -- before this, EventJournal was durable "shadow mode" recording only
+// (never read back), and every network outage just failed/retried via
+// AsyncEventSender's bounded 5-attempt backoff, then gave up with an
+// honest "CHƯA được lưu" (not saved) message -- correct, never silently
+// wrong, but not actually resilient to an outage longer than that backoff
+// window. This makes the journal's PENDING/IN_FLIGHT backlog a REAL queue:
+// a reconnect now walks it in original device_seq order and resends each
+// one, one at a time.
+//
+// Deliberately reuses the SAME sender_/apply_event_response() path a live
+// scan/keypress uses, rather than a second AsyncEventSender + a parallel
+// completion handler: StateProjection::apply()'s existing version-gating
+// (STALE/INCONSISTENT/UNSUPPORTED, state_projection.h) already protects a
+// stale replayed response from ever overwriting state a NEWER live
+// interaction has since moved past -- a replay response arriving "late"
+// relative to fresher live traffic is handled exactly the same, safe way
+// STATE_CONFLICT already is (start_resync()), with zero new conflict logic
+// needed. This is also exactly what makes replay itself safe to resend
+// verbatim: app/mesflow/web/kiosk_v2.py's /events handler is genuinely
+// idempotent by (device_id, event_id) -- an event that actually landed
+// before a drop just gets its original cached response back, never
+// re-applied (see kiosk_v2.py:588-593, `SELECT payload_hash,response_json
+// FROM kiosk_v2_events WHERE device_id=%s AND event_id=%s`).
+//
+// Known, accepted limitation of reusing the live path: apply_event_response()
+// always calls render_current_business_state() with whatever
+// transient_message the response carried, which can (rarely -- only when a
+// reconnect happens to have a real backlog) briefly flash over whatever a
+// DIFFERENT, currently-interacting operator is looking at, since this
+// runtime has no separate "silent background" rendering mode. Documented
+// here rather than solved -- see the final report's Known Gaps.
+void KioskRuntime::start_offline_replay_if_needed() {
+  if (replaying_ || replay_next_ < replay_queue_.size()) return;  // already have/working a queue
+  auto pending = journal_.pending_in_device_seq_order();
+  if (pending.empty()) return;
+
+  replay_queue_.clear();
+  replay_queue_.reserve(pending.size());
+  for (const auto* record : pending) {
+    replay_queue_.push_back(ReplayItem{record->event_id, record->payload, record->device_seq});
+  }
+  replay_next_ = 0;
+  kiosk::health::log_structured(
+      "INFO", "OFFLINE_REPLAY_START", "kiosk_runtime",
+      (std::string("queued=") + std::to_string(replay_queue_.size())).c_str());
+}
+
+void KioskRuntime::check_offline_replay() {
+  if (replay_next_ >= replay_queue_.size()) {
+    if (replaying_) {
+      // Just finished the last item's send (poll() below clears replaying_
+      // once its result lands) -- nothing left to do until the next
+      // reconnect calls start_offline_replay_if_needed() again.
+    }
+    return;
+  }
+  if (replaying_) return;                          // current item's send is still in flight
+  if (sender_.busy() || send_retry_pending_) return;  // a LIVE scan/keypress send has priority
+  if (identity_.state() != ProvisioningState::ACTIVE || env_mismatch_) return;
+
+  const ReplayItem& item = replay_queue_[replay_next_];
+  bool started = sender_.send(api_endpoint_, item.payload.c_str(), item.event_id, item.device_seq);
+  if (started) {
+    replaying_ = true;
+    kiosk::health::log_structured(
+        "INFO", "OFFLINE_REPLAY_SEND", "kiosk_runtime",
+        (std::string("event_id=") + item.event_id + " device_seq=" + std::to_string(item.device_seq) +
+         " (" + std::to_string(replay_next_ + 1) + "/" + std::to_string(replay_queue_.size()) + ")")
+            .c_str());
+  }
+  // If it didn't start (sender_ raced busy between the check above and
+  // here), simply try again on the next poll() -- no state to unwind.
+}
+
 void KioskRuntime::request_manual_resync() {
   if (identity_.state() != ProvisioningState::ACTIVE) {
     kiosk::health::log_structured("INFO", "RECOVERY_MENU_RESYNC_SKIPPED", "kiosk_runtime",
@@ -265,6 +409,7 @@ void KioskRuntime::handle_resync_result(const kiosk::network::StateFetchOutcome&
   if (ok) {
     resyncing_ = false;
     local_qty_buffer_.clear();  // any pre-conflict local input is now stale
+    last_activity_ms_ = millis();  // §13: a resync landing is real activity, not idle time
     render_current_business_state();
   }
   // else: a resync GET itself coming back stale/inconsistent/unsupported is
@@ -343,7 +488,15 @@ void KioskRuntime::handle_scan(const String& raw_code, unsigned long timestamp_m
                                   "scan ignored -- device is in SAFE_MODE");
     return;
   }
+  if (env_mismatch_) {
+    // §3: "KHÔNG CHO PHÉP THAO TÁC" -- no scan reaches the backend at all
+    // while mismatched, same posture as SAFE_MODE above.
+    kiosk::health::log_structured("WARN", "ENV_MISMATCH_SCAN_IGNORED", "kiosk_runtime",
+                                  "scan ignored -- server environment mismatch");
+    return;
+  }
   last_scan_ = raw_code;
+  last_activity_ms_ = millis();  // §13: any scan counts as activity, valid or not
 
   // Immediate LOCAL presentation feedback — before any network attempt.
   // §12: this must render well under the 100ms local-feedback target since
@@ -379,6 +532,7 @@ void KioskRuntime::reset_quantity_flow() {
   qty_good_ = 0;
   qty_defect_ = 0;
   local_qty_buffer_.clear();
+  qty_timeout_warned_ = false;
 }
 
 void KioskRuntime::submit_final_quantity(int32_t good, int32_t defect, int32_t rework) {
@@ -394,10 +548,28 @@ void KioskRuntime::submit_final_quantity(int32_t good, int32_t defect, int32_t r
 
 void KioskRuntime::handle_business_key(char key) {
   if (kiosk::health::is_safe_mode()) return;  // SAFE_MODE: no business flow -- see handle_scan()'s own comment
+  if (env_mismatch_) return;  // §3: no business flow while server environment is mismatched
   if (identity_.state() != ProvisioningState::ACTIVE) return;
   if (!state_projection_.has_snapshot() || resyncing_) return;  // no server authority to act against yet
 
+  last_activity_ms_ = millis();  // §13: any accepted business keypress counts as activity
+
   kiosk::protocol::BusinessState state = state_projection_.current().state;
+
+  // §7/§12 of the 2026-08-26 UX-hardening pass: WAIT_OPERATION had no way
+  // out short of the '*'-hold Wi-Fi-recovery menu (a diagnostic tool, not a
+  // business action) -- '#' is unused in this state (handle_business_key
+  // previously had no branch for it at all), so it's free to mean "Hủy"
+  // here. Reuses CANCEL_REQUESTED, which app/mesflow/web/kiosk_v2.py's
+  // _apply_event() already implements correctly server-side (refuses only
+  // when a real work_session_id is open, which WAIT_OPERATION never has --
+  // that only exists after SESSION_ACTIVE/QUANTITY_INPUT) -- no new backend
+  // work needed, this was simply never dispatched from any keypad path.
+  if (state == kiosk::protocol::BusinessState::WAIT_OPERATION && key == '#') {
+    kiosk::protocol::OptionalQuantity none;
+    send_business_event(kiosk::protocol::EventType::CANCEL_REQUESTED, "", none);
+    return;
+  }
 
   // GOOD/DEFECT/REWORK quantity flow: purely local sub-steps within the one
   // server state QUANTITY_INPUT (see QtyStep in kiosk_runtime.h). Keypad
@@ -703,9 +875,76 @@ void KioskRuntime::check_error_view_timeout() {
   refresh_idle_screen();
 }
 
+// §13 of the 2026-08-26 ESP kiosk UX-hardening pass: central inactivity
+// timeout, replacing "no timeout at all" for WAIT_OPERATION/QUANTITY_INPUT
+// (the only two business states ui_timeout_policy.h assigns a nonzero
+// value -- see that file for why the others are 0).
+void KioskRuntime::check_ui_timeout() {
+  if (kiosk::health::is_safe_mode()) return;
+  if (env_mismatch_) return;  // §3: no business action (including a timeout-driven cancel) while mismatched
+  if (identity_.state() != ProvisioningState::ACTIVE) return;
+  if (!state_projection_.has_snapshot() || resyncing_) return;
+  if (sender_.busy() || send_retry_pending_) return;  // a send is already in flight -- let it resolve first
+
+  kiosk::protocol::BusinessState state = state_projection_.current().state;
+  uint32_t timeout_ms = ui_timeout_ms_for_state(state);
+  if (timeout_ms == 0) return;
+
+  uint32_t elapsed_ms = static_cast<uint32_t>(millis() - last_activity_ms_);
+  if (!ui_state_should_timeout(state, elapsed_ms)) return;
+
+  if (state == kiosk::protocol::BusinessState::WAIT_OPERATION) {
+    // Same CANCEL_REQUESTED path as the '#' key (handle_business_key) --
+    // the backend cleanly returns WAIT_EMPLOYEE since no work_session_id is
+    // open yet in this state. Reset the clock immediately so this doesn't
+    // refire every poll() while the cancel itself is in flight.
+    last_activity_ms_ = millis();
+    kiosk::health::log_structured("INFO", "UI_TIMEOUT_CANCEL", "kiosk_runtime",
+                                   "WAIT_OPERATION idle timeout -> CANCEL_REQUESTED");
+    kiosk::protocol::OptionalQuantity none;
+    send_business_event(kiosk::protocol::EventType::CANCEL_REQUESTED, "", none);
+    return;
+  }
+
+  if (state == kiosk::protocol::BusinessState::QUANTITY_INPUT) {
+    // Deliberately NOT a CANCEL_REQUESTED here (see ui_timeout_policy.h's
+    // header comment): a real work_session is already open by the time the
+    // device reaches QUANTITY_INPUT, and the backend correctly refuses to
+    // cancel one (CANCEL_NOT_SUPPORTED) -- silently discarding an
+    // in-progress FINISH would be worse than leaving the screen up. First
+    // timeout: warn and re-arm for one more window. Second consecutive
+    // timeout: give up trying to prompt further and just re-render the
+    // current authoritative state (still QUANTITY_INPUT -- a human must
+    // complete it, or a supervisor must intervene server-side).
+    last_activity_ms_ = millis();
+    if (!qty_timeout_warned_) {
+      qty_timeout_warned_ = true;
+      kiosk::health::log_structured("INFO", "UI_TIMEOUT_WARN", "kiosk_runtime",
+                                     "QUANTITY_INPUT idle timeout -- warning operator, session stays open");
+      render_current_business_state("Vui lòng nhập số lượng", true, false);
+    } else {
+      kiosk::health::log_structured("INFO", "UI_TIMEOUT_STAY", "kiosk_runtime",
+                                     "QUANTITY_INPUT idle timeout again -- staying (real session open, no safe reset)");
+      refresh_idle_screen();
+    }
+    return;
+  }
+}
+
 void KioskRuntime::poll() {
   kiosk::network::SendOutcome result;
+  bool was_replay = replaying_;  // captured before any of the shared bookkeeping below runs
   if (sender_.poll(result)) {
+    if (was_replay) {
+      // §17/§19: exactly one attempt per item per reconnect cycle -- a
+      // failure leaves it PENDING in the journal (the existing failure-path
+      // journal_.append_transition() below already does this, replay or
+      // not) and the NEXT reconnect's start_offline_replay_if_needed() will
+      // naturally pick it up again. Advance regardless of outcome so a
+      // single stuck item can never wedge the rest of the backlog forever.
+      replaying_ = false;
+      ++replay_next_;
+    }
     scan_pending_result_ = false;
     has_scanned_ = true;
     last_backend_ok_ = result.outcome.ok;
@@ -746,9 +985,28 @@ void KioskRuntime::poll() {
       jt.last_error_code = result.outcome.error_code;
       journal_.append_transition(jt);
 
-      String msg_line = result.outcome.error_code == "NET_WIFI_DOWN"
-                            ? String("Không có Wi-Fi - CHƯA được lưu")
-                            : String("Lỗi kết nối máy chủ - CHƯA được lưu");
+      // §14/§Error Recovery of the 2026-08-26 UX-hardening pass: verified
+      // (not assumed) against retry_policy.cpp before changing anything --
+      // classify_http_result() already correctly buckets every 4xx as
+      // non-retryable and every 5xx as retryable (both accurate already),
+      // but collapses 401/403/404/409/etc. into one generic "HTTP_4XX"
+      // error_code, discarding the real status -- this device's message
+      // for a deauthorized/forbidden device looked IDENTICAL to a plain
+      // network blip ("Lỗi kết nối máy chủ"), even though
+      // result.outcome.http_status (a separate field, always populated)
+      // already has the real answer. Genuine gap: fixed here without
+      // touching retry_policy.cpp's own classification, which was already
+      // correct.
+      String msg_line;
+      if (result.outcome.error_code == "NET_WIFI_DOWN") {
+        msg_line = "Không có Wi-Fi - CHƯA được lưu";
+      } else if (result.outcome.http_status == 401 || result.outcome.http_status == 403) {
+        msg_line = "THIẾT BỊ KHÔNG ĐƯỢC PHÉP - Liên hệ quản trị";
+      } else if (result.outcome.error_code == "HTTP_5XX") {
+        msg_line = "SERVER ĐANG LỖI - Thử lại sau";
+      } else {
+        msg_line = "Lỗi kết nối máy chủ - CHƯA được lưu";
+      }
       render_current_business_state(msg_line, true, true);
     } else {
       kiosk::protocol::EventResponse resp;
@@ -764,12 +1022,21 @@ void KioskRuntime::poll() {
 
   check_send_retry();
   check_error_view_timeout();
+  check_ui_timeout();
+  check_offline_replay();
+
+  // §6/§18: keep the status bar's queue count current. Cheap (an in-memory
+  // map-size read, journal_.counts()) -- fine to do every poll().
+  auto journal_counts = journal_.counts();
+  renderer_.set_offline_queue_size(journal_counts.pending + journal_counts.in_flight);
 }
 
 void KioskRuntime::apply_event_response(bool parsed, const kiosk::protocol::EventResponse& resp,
                                         const std::string& event_id) {
   using kiosk::protocol::ApplyResult;
   using kiosk::protocol::EventOutcomeKind;
+
+  last_activity_ms_ = millis();  // §13: any server round-trip landing (parsed or not) counts as activity
 
   if (!parsed || resp.kind == EventOutcomeKind::MALFORMED) {
     kiosk::health::log_structured("ERROR", "EVENT_RESPONSE_MALFORMED", "kiosk_runtime", event_id.c_str());
@@ -831,6 +1098,7 @@ void KioskRuntime::apply_event_response(bool parsed, const kiosk::protocol::Even
   switch (apply_result) {
     case ApplyResult::APPLIED:
     case ApplyResult::APPLIED_IDENTICAL: {
+      last_sync_iso_ = time_sync_.iso8601_now().c_str();  // §4: a real applied server response counts as a sync
       bool is_err = resp.kind == EventOutcomeKind::BUSINESS_REJECTED;
       // Shadow-mode journal: the one clean terminal transition -- the
       // server gave a real, parsed, applied business answer. ACKED for a
