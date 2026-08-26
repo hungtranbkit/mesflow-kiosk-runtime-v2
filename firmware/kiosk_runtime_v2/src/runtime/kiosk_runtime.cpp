@@ -525,6 +525,29 @@ void KioskRuntime::handle_scan(const String& raw_code, unsigned long timestamp_m
   // scan will be rejected below -- the operator should always see "the
   // scanner read something" regardless of what happens next.
   renderer_.draw_scan_received(raw_code, wifi_indicator_);
+  // Scan latency instrumentation: T1 ("QR accepted after debounce", i.e.
+  // right after the immediate local feedback draw completes) -- read back
+  // in poll() once this scan's server response lands.
+  //
+  // Real bug found live testing this exact instrumentation on real hardware
+  // (2026-08-26): this used to run unconditionally, even while a PREVIOUS
+  // scan/event's send was still genuinely in flight (a real, if rare,
+  // possibility on a slow/lossy Wi-Fi link -- exactly the condition this
+  // whole latency investigation cares about). That overlapping scan gets
+  // busy-guard-rejected inside send_business_event() without ever touching
+  // last_scan_dispatch_ms_, but this line had already clobbered
+  // last_scan_received_ms_ with a NEWER timestamp -- so once the ORIGINAL
+  // (still in-flight) scan's response finally landed, poll() computed
+  // last_scan_dispatch_ms_ (old, smaller) - last_scan_received_ms_ (new,
+  // larger), an unsigned subtraction that UNDERFLOWS to a huge garbage
+  // number (observed live: firmware_local_ms=4294961574). scan_pending_
+  // result_ is exactly "is a previous send's result still outstanding" --
+  // skip the overwrite while that's true and let the busy-rejected scan's
+  // own (correct, do-nothing) path run without disturbing the in-flight
+  // scan's own timing.
+  if (!scan_pending_result_) {
+    last_scan_received_ms_ = millis();
+  }
 
   ProvisioningState state = identity_.state();
   if (state != ProvisioningState::ACTIVE) {
@@ -796,6 +819,10 @@ void KioskRuntime::send_business_event(kiosk::protocol::EventType type, const St
     render_current_business_state("Đang gửi...", false);
   }
 
+  // Scan latency instrumentation: T2 ("HTTP request started"), i.e. right
+  // before handing off to AsyncEventSender. Set unconditionally (cheap, one
+  // millis() read) -- only ever read back for a SCAN in poll(), see there.
+  last_scan_dispatch_ms_ = millis();
   bool started = sender_.send(api_endpoint_, json_body.c_str(), event.event.event_id,
                               event.event.device_seq);
   if (started) {
@@ -985,6 +1012,12 @@ void KioskRuntime::poll() {
     last_error_code_ = result.outcome.error_code;
     last_latency_ms_ = result.total_latency_ms;
     last_retry_count_ = result.attempts > 0 ? result.attempts - 1 : 0;
+    // Scan latency instrumentation: this response belongs to the exact scan
+    // currently being timed only if it's still the most recent SCAN send AND
+    // matches its event_id (a later keypress event's response landing while
+    // a stale timestamp is still set must never be mistaken for it).
+    bool is_timed_scan = last_event_type_ == kiosk::protocol::EventType::SCAN &&
+                         result.event_id == last_event_id_ && last_scan_received_ms_ != 0;
 
     // §66/§27: structured evidence tying this result back to the specific
     // event_id/device_seq it belongs to.
@@ -1041,10 +1074,41 @@ void KioskRuntime::poll() {
         msg_line = "Lỗi kết nối máy chủ - CHƯA được lưu";
       }
       render_current_business_state(msg_line, true, true);
+      if (is_timed_scan) {
+        // A failed round trip is already fully accounted for by the
+        // EVENT_FAILED line just above (same latency_ms/retry_count) --
+        // just clear the timestamp so it can't leak into a later, unrelated
+        // event's SCAN_LATENCY calculation.
+        last_scan_received_ms_ = 0;
+      }
     } else {
       kiosk::protocol::EventResponse resp;
       bool parsed = kiosk::protocol::parse_event_response_json(result.response_body, resp);
+      unsigned long render_t0 = millis();
       apply_event_response(parsed, resp, result.event_id);
+      // Defensive: dispatch must never be BEFORE received for a genuinely
+      // timed scan -- if it somehow is (an edge case this codebase's own
+      // instrumentation bug hunt didn't anticipate, or the ~49-day millis()
+      // rollover), skip logging a garbage underflowed number rather than
+      // report a false "10000+ second" outlier.
+      if (is_timed_scan && last_scan_dispatch_ms_ < last_scan_received_ms_) {
+        kiosk::health::log_structured("WARN", "SCAN_LATENCY_SKIPPED", "kiosk_runtime",
+                                      "dispatch timestamp precedes received timestamp -- discarding");
+        is_timed_scan = false;
+        last_scan_received_ms_ = 0;
+      }
+      if (is_timed_scan) {
+        unsigned long render_took = millis() - render_t0;
+        unsigned long firmware_local_ms = last_scan_dispatch_ms_ - last_scan_received_ms_;
+        unsigned long total_ms = millis() - last_scan_received_ms_;
+        char lat_msg[176];
+        snprintf(lat_msg, sizeof(lat_msg),
+                 "event_id=%s firmware_local_ms=%lu network_ms=%u retry_count=%d render_ms=%lu total_ms=%lu",
+                 result.event_id.c_str(), firmware_local_ms, result.total_latency_ms, last_retry_count_,
+                 render_took, total_ms);
+        kiosk::health::log_structured("INFO", "SCAN_LATENCY", "kiosk_runtime", lat_msg);
+        last_scan_received_ms_ = 0;  // consumed -- avoid re-logging against a later, unrelated event
+      }
     }
   }
 

@@ -215,6 +215,17 @@ class KioskRuntime {
   bool scan_pending_result_ = false;  // true between the immediate feedback draw and the async result arriving
   String pending_raw_code_;
 
+  // --- Scan latency instrumentation (2026-08-26 shared-terminal/latency
+  // task) --- millis() checkpoints for a SCAN event only, read back in
+  // poll() once that event's response lands, to log a single consolidated
+  // SCAN_LATENCY breakdown (firmware-local time before the network send
+  // even started, vs. network round-trip time, vs. render time). 0 means
+  // "no scan currently being timed" -- a SCAN's own dispatch always sets
+  // both before sender_.send() is called, so a real 0 can only mean this
+  // boot has never sent one yet.
+  unsigned long last_scan_received_ms_ = 0;   // set in handle_scan(), right after the immediate feedback draw
+  unsigned long last_scan_dispatch_ms_ = 0;   // set in send_business_event(), right before sender_.send()
+
   // Phase 2 additions --------------------------------------------------
   bool resyncing_ = false;           // true while a STATE_CONFLICT resync GET /state is outstanding
   int64_t last_server_seq_ = -1;     // -1 = never seen one yet

@@ -17,15 +17,35 @@
 #define RUNTIME_TARGET_SERVER_UX_MS 300
 #define RUNTIME_TARGET_SERVER_UX_WARN_MS 800
 #define RUNTIME_TARGET_SERVER_UX_DEGRADED_MS 2000
-#define RUNTIME_HTTP_TIMEOUT_MS 5000
-// Hard backstop enforced by api_client itself (a separate FreeRTOS task +
-// caller-side deadline), NOT just HTTPClient's own timeout knobs -- those
-// were observed on real hardware to not reliably bound a connect attempt to
-// an unreachable IP (the call can block far longer than configured, with no
-// watchdog rescue since a properly-yielding blocked task doesn't starve the
-// idle task). Deliberately a bit above RUNTIME_HTTP_TIMEOUT_MS: the
-// library's own timeout should normally fire first; this is the guarantee
-// that the UI is never stuck longer than this no matter what.
+// Scan-latency investigation (2026-08-26): lowered from 5000. Real evidence
+// from the physical test board on its normal shop-floor Wi-Fi ("Airport"):
+// the backend itself is consistently fast (confirmed via kiosk_v2.py's own
+// _TIMING_ENABLED instrumentation -- ~70-150ms total_backend_ms per event,
+// even including the idempotency lookup + employee/session lookups + a
+// commit), and every genuinely SUCCESSFUL single-attempt round trip observed
+// live landed well under 1.5s (267-1478ms across a real multi-scan session).
+// A stalled attempt, though, was riding the full old 5000ms timeout before
+// falling through to a retry -- two such attempts back to back (a real,
+// observed retry_count=1 case measured 6438-6790ms for ONE retry alone) is
+// exactly the >10s class of symptom reported. 2500ms keeps ~1.7x headroom
+// over the worst observed SUCCESSFUL attempt (1478ms) -- generous enough not
+// to punish a merely-slow-but-working request -- while roughly halving the
+// worst-case single-attempt stall a genuinely bad request pays before
+// retrying. Retry/backoff policy itself (RETRY_BACKOFF_BASE_MS etc. below)
+// is unchanged -- no live evidence it needs to change, only the per-attempt
+// ceiling did.
+#define RUNTIME_HTTP_TIMEOUT_MS 2500
+// NOTE (found auditing this file for the same task, NOT fixed here -- flagged
+// in the field report instead): RUNTIME_HTTP_HARD_DEADLINE_MS below is dead
+// code. Its own comment describes "a separate FreeRTOS task + caller-side
+// deadline" enforced by api_client.cpp -- grepping the actual source shows
+// no such enforcement exists; the constant is defined and never referenced
+// anywhere. HTTPClient's own setTimeout()/setConnectTimeout() (which IS
+// wired up, and which this task's live testing confirms actually fires
+// around its configured value) is currently the ONLY bound on a single
+// attempt. Implementing the caller-side hard backstop this comment already
+// describes is a real, independent gap -- left for a dedicated pass rather
+// than folded into this scan-latency fix.
 #define RUNTIME_HTTP_HARD_DEADLINE_MS 8000
 
 // Scanner physical-duplicate suppression window. Not a business dedupe
