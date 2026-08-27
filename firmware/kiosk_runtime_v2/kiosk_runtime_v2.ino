@@ -120,14 +120,14 @@ kiosk::hardware::SelfTestResult g_selftest;
 kiosk::runtime::BootDiagnostics g_diagnostics;
 
 kiosk::network::HeartbeatClient g_heartbeat(g_identity, g_time_sync, g_runtime, g_keypad, g_selftest,
-                                            g_diagnostics, g_bootstrap, g_network_worker);
+                                            g_diagnostics, g_bootstrap, g_network_worker, g_wifi);
 
 #if MESFLOW_DEBUG_API
 // Constructed after g_selftest/g_diagnostics exist (it holds a reference to
 // them) but only actually started in setup() once they've been populated.
 kiosk::debug::DebugServer g_debug_server(g_bus, g_display, g_renderer, g_runtime, g_keypad,
                                           g_selftest, g_diagnostics, g_identity, g_time_sync,
-                                          g_bootstrap, g_ui_bundle_store, g_ui_sync);
+                                          g_bootstrap, g_ui_bundle_store, g_ui_sync, g_wifi);
 #endif
 
 unsigned long g_last_diagnostics_print_ms = 0;

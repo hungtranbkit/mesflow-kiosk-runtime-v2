@@ -209,7 +209,7 @@ std::string DebugServer::build_device_state_json() {
   // that's a debug/screenshot-specific detail heartbeat doesn't need.
   std::string json =
       kiosk::runtime::build_status_json(identity_, time_sync_, runtime_, keypad_, selftest_,
-                                        diagnostics_, bootstrap_);
+                                        diagnostics_, bootstrap_, wifi_);
   // Splice in framebuffer_bytes/qa/last_input_seq without a second JSON
   // parser: append as sibling top-level fields (simpler and still
   // perfectly valid/parseable JSON for consumers).

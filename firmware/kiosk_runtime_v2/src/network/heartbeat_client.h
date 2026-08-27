@@ -10,6 +10,7 @@
 #include "bootstrap_client.h"
 #include "network_worker.h"
 #include "time_sync.h"
+#include "wifi_manager.h"
 
 namespace kiosk::network {
 
@@ -34,7 +35,7 @@ class HeartbeatClient {
                   kiosk::runtime::KioskRuntime& runtime, kiosk::hardware::KeypadPcf8574& keypad,
                   const kiosk::hardware::SelfTestResult& selftest,
                   kiosk::runtime::BootDiagnostics& diagnostics, const BootstrapClient& bootstrap,
-                  NetworkWorker& network)
+                  NetworkWorker& network, const WifiManager& wifi)
       : identity_(identity),
         time_sync_(time_sync),
         runtime_(runtime),
@@ -42,7 +43,8 @@ class HeartbeatClient {
         selftest_(selftest),
         diagnostics_(diagnostics),
         bootstrap_(bootstrap),
-        network_(network) {}
+        network_(network),
+        wifi_(wifi) {}
 
   // Call every loop() iteration; internally paced by HEARTBEAT_INTERVAL_MS.
   void poll(const String& backend_url);
@@ -56,6 +58,7 @@ class HeartbeatClient {
   kiosk::runtime::BootDiagnostics& diagnostics_;
   const BootstrapClient& bootstrap_;
   NetworkWorker& network_;
+  const WifiManager& wifi_;
 
   unsigned long last_attempt_ms_ = 0;
 };

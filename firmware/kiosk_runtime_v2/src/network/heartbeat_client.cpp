@@ -33,7 +33,7 @@ void HeartbeatClient::poll(const String& backend_url) {
   // Cheap, in-memory, no I/O -- safe to build on the calling thread.
   std::string body =
       kiosk::runtime::build_status_json(identity_, time_sync_, runtime_, keypad_, selftest_,
-                                        diagnostics_, bootstrap_);
+                                        diagnostics_, bootstrap_, wifi_);
 
   // §2-§5: no more per-call task creation -- just enqueue onto the shared
   // worker's LOW-priority tier. If the LOW queue is momentarily full
