@@ -878,10 +878,31 @@ void KioskRuntime::send_business_event(kiosk::protocol::EventType type, const St
     jr.created_uptime_ms = event.time.uptime_ms;
     jr.time_sync_status = kiosk::protocol::time_sync_status_to_string(event.time.sync_status);
     jr.sync_status = kiosk::protocol::JournalSyncStatus::PENDING;
-    journal_.append_event(jr);  // failure (FULL/DUPLICATE) is logged internally
+    // Real bug found live (2026-08-27 "Final Reliability Standardization"
+    // pass, §10/§11/R1): this return value used to be discarded entirely --
+    // a FULL journal (the only realistic failure mode; DUPLICATE_EVENT can't
+    // happen here since event_id was just freshly generated above) meant
+    // this code proceeded exactly as if the record were durable: still
+    // attempted the network send, and on ANY subsequent failure (network
+    // queue full, WiFi down, server unreachable) told the operator "ĐÃ LƯU"
+    // (SAVED) for an action that was NEVER actually persisted anywhere --
+    // the single worst thing this whole reliability contract exists to
+    // prevent (R1: never acknowledge locally before durable persistence).
+    // Checked now: a failed append aborts here, before any network attempt,
+    // with an honest "not recorded" message -- never a false "ĐÃ LƯU".
+    bool journaled_ok = journal_.append_event(jr);
 #if MESFLOW_DEBUG_API
     kiosk::health::log_memory_snapshot("AFTER_JOURNAL_APPEND");
 #endif
+    if (!journaled_ok) {
+      kiosk::health::log_structured("ERROR", "EVENT_NOT_DURABLE", "kiosk_runtime",
+                                    (std::string("event_id=") + event.event.event_id +
+                                     " journal_pressure=" +
+                                     std::to_string(static_cast<int>(journal_.pressure())))
+                                        .c_str());
+      render_current_business_state("BỘ NHỚ CHỜ GỬI ĐÃ ĐẦY - CHƯA được lưu", true, true);
+      return;
+    }
   }
 
   kiosk::health::log_structured(
@@ -1152,24 +1173,48 @@ void KioskRuntime::poll() {
     }
 
     if (!result.outcome.ok) {
-      // Transport-level failure (no response at all, or a 4xx/5xx that
-      // never reached the business layer -- §83: every business outcome,
-      // accept/reject/conflict, is HTTP 200) -- the authoritative state is
-      // simply unknown to have changed; stay on the current screen and
-      // surface an honest transient error.
+      // Transport-level failure (no response at all), OR a real non-2xx HTTP
+      // response the business layer never parses (see the §14 comment just
+      // below -- "every business outcome is HTTP 200" was true for
+      // ACCEPTED/REJECTED/CONFLICT, but is NOT true for 401/403 device-not-
+      // allowed or 409 idempotency-payload-mismatch, both confirmed live
+      // against app/mesflow/web/kiosk_v2.py). The authoritative STATE
+      // (state_projection_) is simply unknown to have changed either way;
+      // stay on the current screen and surface an honest error.
       //
-      // Shadow-mode journal: docs/OFFLINE.md's "TIMEOUT DOES NOT MEAN
-      // SERVER DID NOT PROCESS" -- a transport failure is NEVER recorded as
-      // REJECTED/CONFLICT here (that would be a guess), only as still-
-      // PENDING with the attempt/error recorded. Phase 3B's replay logic is
-      // exactly what will later act on this; Phase 3A only observes it.
+      // Real bug found live (2026-08-27 "Final Reliability Standardization"
+      // pass, §2/§6/R8/R9): this used to journal EVERY !ok outcome as
+      // PENDING unconditionally, including outcome.retryable == false cases
+      // -- classify_http_result() already correctly marks 401/403/409/4xx
+      // as non-retryable, but nothing here ever consulted that flag, so a
+      // permanently-doomed event (wrong device, or a genuine payload/
+      // event_id reuse conflict) stayed PENDING forever and got resent by
+      // EVERY future offline-replay/reconnect cycle -- exactly the "retry a
+      // permanent error forever" anti-pattern §2 explicitly forbids, and a
+      // real violation of R9 (terminal events may only be compacted after
+      // durable TERMINAL state -- this event could never even reach one).
+      // A genuinely transient transport failure (DNS/TCP/timeout/5xx/429,
+      // all outcome.retryable == true) still correctly stays PENDING --
+      // docs/OFFLINE.md's "TIMEOUT DOES NOT MEAN SERVER DID NOT PROCESS"
+      // reasoning is unchanged for those.
+      bool permanent = !result.outcome.retryable;
       kiosk::protocol::JournalTransition jt;
       jt.event_id = result.event_id;
-      jt.sync_status = kiosk::protocol::JournalSyncStatus::PENDING;
+      jt.sync_status = permanent ? kiosk::protocol::JournalSyncStatus::HUMAN_REVIEW
+                                 : kiosk::protocol::JournalSyncStatus::PENDING;
       jt.retry_count = static_cast<uint32_t>(last_retry_count_);
       jt.last_attempt_uptime_ms = millis();
       jt.last_error_code = result.outcome.error_code;
       journal_.append_transition(jt);
+      if (permanent) {
+        kiosk::health::log_structured(
+            "ERROR", "EVENT_PERMANENT_FAILURE", "kiosk_runtime",
+            (std::string("event_id=") + result.event_id +
+             " http_status=" + std::to_string(result.outcome.http_status) +
+             " error_code=" + result.outcome.error_code +
+             " -- marked HUMAN_REVIEW, will NOT be retried")
+                .c_str());
+      }
 
       // §14/§Error Recovery of the 2026-08-26 UX-hardening pass: verified
       // (not assumed) against retry_policy.cpp before changing anything --
