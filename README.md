@@ -374,3 +374,4 @@ Known gaps in this pass (honestly deferred, not silently skipped):
 Phase 2 — Server Authoritative State + Workflow Contract: real
 stable/transient state machine driven by backend responses, `state_version`
 tracking and RESYNC, replacing the `READY_LOCAL` placeholder.
+# mesflow-kiosk-runtime-v2
