@@ -900,6 +900,89 @@ void Renderer::draw_quantity_rework_screen(const kiosk::protocol::ViewModel& vie
   end_screen();
 }
 
+void Renderer::draw_quantity_summary_screen(const kiosk::protocol::ViewModel& view, int32_t good, int32_t defect,
+                                            int32_t rework, const String& transient_message, bool is_error,
+                                            WifiIndicator wifi) {
+  begin_screen("state_quantity_summary");
+  if (view.has_operation_name) {
+    draw_fit_text(String(view.operation_name.c_str()), kContentTop + kSpacingSmall, kColorMuted,
+                 /*prefer_large=*/false);
+  }
+  draw_title_2line("XÁC NHẬN", "SỐ LƯỢNG", 74, kColorAccent);
+
+  char good_line[24];
+  snprintf(good_line, sizeof(good_line), "Đạt: %ld", static_cast<long>(good));
+  String good_s(good_line);
+  emit_component_text(centered_x(good_s, kFontLarge), 150, good_s, kColorAccent, kFontLarge);
+
+  char defect_line[24];
+  snprintf(defect_line, sizeof(defect_line), "Lỗi: %ld", static_cast<long>(defect));
+  String defect_s(defect_line);
+  emit_component_text(centered_x(defect_s, kFontLarge), 178, defect_s, defect > 0 ? kColorErr : kColorMuted,
+                      kFontLarge);
+
+  // rework is only ever meaningful when defect > 0 AND the operator chose
+  // "CÓ" (repairable) -- showing "Sửa: 0" for the other two paths (DEFECT
+  // ==0, or "KHÔNG" repairable) would just be noise for a value nobody
+  // actually entered.
+  if (rework > 0) {
+    char rework_line[24];
+    snprintf(rework_line, sizeof(rework_line), "Sửa: %ld", static_cast<long>(rework));
+    String rework_s(rework_line);
+    emit_component_text(centered_x(rework_s, kFontLarge), 206, rework_s, kColorWarn, kFontLarge);
+  }
+
+  if (transient_message.length() > 0) {
+    draw_fit_text(transient_message, kFooterDividerY - kLineHeightSmall - kSpacingSmall,
+                 is_error ? kColorErr : kColorFg, /*prefer_large=*/false);
+  }
+  // "0" not "*" -- see kiosk_runtime.cpp's SUMMARY key-handling comment for
+  // why '*' can't be used here (it never reaches business-key handling at
+  // all, globally reserved for the Wi-Fi-recovery hold gesture).
+  draw_footer("0 SỬA LẠI", "# XÁC NHẬN");
+  draw_status_bar(wifi);
+  end_screen();
+}
+
+void Renderer::draw_finish_result_screen(const String& employee_name, const String& operation_code,
+                                         int32_t good, int32_t defect, int32_t rework,
+                                         WifiIndicator wifi) {
+  begin_screen("finish_result");
+  draw_title_2line("HOÀN TẤT", "", 60, kColorAccent);
+
+  if (employee_name.length() > 0) {
+    draw_fit_text(employee_name, kContentTop + 40, kColorFg, /*prefer_large=*/false);
+  }
+  if (operation_code.length() > 0) {
+    draw_fit_text(operation_code, kContentTop + 66, kColorMuted, /*prefer_large=*/false);
+  }
+
+  char good_line[24];
+  snprintf(good_line, sizeof(good_line), "Đạt: %ld", static_cast<long>(good));
+  String good_s(good_line);
+  emit_component_text(centered_x(good_s, kFontLarge), 150, good_s, kColorAccent, kFontLarge);
+
+  char defect_line[24];
+  snprintf(defect_line, sizeof(defect_line), "Lỗi: %ld", static_cast<long>(defect));
+  String defect_s(defect_line);
+  emit_component_text(centered_x(defect_s, kFontLarge), 178, defect_s, defect > 0 ? kColorErr : kColorMuted,
+                      kFontLarge);
+
+  if (rework > 0) {
+    char rework_line[24];
+    snprintf(rework_line, sizeof(rework_line), "Sửa: %ld", static_cast<long>(rework));
+    String rework_s(rework_line);
+    emit_component_text(centered_x(rework_s, kFontLarge), 206, rework_s, kColorWarn, kFontLarge);
+  }
+
+  // No footer hints -- this screen takes no key input (§ below in
+  // kiosk_runtime.cpp: a new scan/key press during the hold dismisses it
+  // immediately anyway), it just auto-returns to the card-scan screen once
+  // kFinishResultHoldMs elapses.
+  draw_status_bar(wifi);
+  end_screen();
+}
+
 void Renderer::draw_from_bundle(const kiosk::protocol::UiScreen& screen,
                                 const kiosk::protocol::ViewModel& view, const String& local_digit_buffer,
                                 const String& transient_message, bool is_error, WifiIndicator wifi) {

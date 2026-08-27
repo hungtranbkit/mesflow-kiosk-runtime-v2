@@ -180,6 +180,28 @@ class Renderer {
   void draw_quantity_rework_screen(const kiosk::protocol::ViewModel& view,
                                    const String& local_digit_buffer, int32_t defect_so_far,
                                    const String& transient_message, bool is_error, WifiIndicator wifi);
+  // Real field report (2026-08-27): a review/confirm screen shown once
+  // GOOD/DEFECT/REWORK are all collected, before the real submit fires --
+  // see kiosk::runtime::QtyStep::SUMMARY's own comment for why. rework is
+  // shown only when > 0 (DEFECT==0 and "not repairable" both leave it
+  // meaninglessly 0 -- showing "Sửa: 0" in those cases would just be noise
+  // next to values the operator never actually chose).
+  void draw_quantity_summary_screen(const kiosk::protocol::ViewModel& view, int32_t good, int32_t defect,
+                                    int32_t rework, const String& transient_message, bool is_error,
+                                    WifiIndicator wifi);
+
+  // Field report (2026-08-27): "khi quet op xong, nên co man hình tổng hợp
+  // là tên gì, làm op gì... 5-10 giay gi do mới chuyen qua man hinh quet
+  // thẻ" -- after a FINISH is actually accepted by the server (session
+  // closed, device moved back to WAIT_EMPLOYEE), hold a plain confirmation
+  // screen naming WHO just finished WHAT for a few seconds before the
+  // normal card-scan screen takes over, instead of jumping back to
+  // WAIT_EMPLOYEE instantly. employee_name/operation_code are captured by
+  // the caller from the OUTGOING snapshot's view (the new WAIT_EMPLOYEE
+  // snapshot carries neither) -- both plain strings, already resolved, no
+  // ViewModel needed here.
+  void draw_finish_result_screen(const String& employee_name, const String& operation_code, int32_t good,
+                                 int32_t defect, int32_t rework, WifiIndicator wifi);
 
   // Shown while a STATE_CONFLICT response has told the device to re-fetch
   // authoritative state via GET /state (§8) -- deliberately not one of the

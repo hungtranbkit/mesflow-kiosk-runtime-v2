@@ -1,7 +1,10 @@
 #pragma once
 
 #include <Arduino.h>
+#include <WiFi.h>
 
+#include "../config/runtime_config.h"  // MESFLOW_DEBUG_API
+#include "../health/structured_log.h"
 #include "../runtime/event_bus.h"
 
 namespace kiosk::network {
@@ -53,6 +56,28 @@ class WifiManager {
   // path, it also naturally re-arms bootstrap/offline-replay via the
   // reconnect_count() bump the .ino already watches for.
   void force_reconnect();
+
+#if MESFLOW_DEBUG_API
+  // §1 of the 2026-08-27 "Final Field-Readiness Verification" pass: a
+  // DEV-only hook for the 'debug-wifi-drop' serial command, to exercise
+  // the REAL recovery path (this class's own CONNECTED -> [poll() notices
+  // WiFi.status()!=WL_CONNECTED] -> DISCONNECTED -> 10s cooldown ->
+  // CONNECTING -> CONNECTED cycle) without needing physical AP control.
+  // Deliberately just WiFi.disconnect() and nothing else -- no state_
+  // change here, no re-arm, no touching ssid_/password_/NVS credentials at
+  // all -- the NEXT poll() call discovers the drop exactly the way a real
+  // AP-side disconnect would be discovered, so this is the SAME code path
+  // a genuine outage takes, not a shortcut around it. force_reconnect()
+  // above is NOT reused for this because it immediately re-arms
+  // (next_retry_ms_ = millis(), skipping the cooldown) -- that's correct
+  // for its own real self-recovery purpose but would skip over the exact
+  // DISCONNECTED/cooldown window this test hook exists to exercise.
+  void simulate_disconnect_for_test() {
+    kiosk::health::log_structured("WARN", "NET_WIFI_TEST_DROP", "wifi_manager",
+                                  "debug-wifi-drop -- forcing a real radio disconnect for testing");
+    WiFi.disconnect();
+  }
+#endif
 
  private:
   kiosk::runtime::EventBus& bus_;

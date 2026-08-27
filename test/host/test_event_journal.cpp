@@ -483,6 +483,25 @@ int main() {
     check(idx.should_consider_compaction(), "70.0% usage crosses the WARNING boundary and urges compaction");
   }
 
+  // --- should_consider_compaction() also fires on record COUNT alone
+  // (2026-08-27 "Final Runtime Closure" pass, §6) -- a burst of many small
+  // records must not be able to hide from compaction just because their
+  // combined bytes stay under the 70% threshold. Huge capacity here keeps
+  // usage_pct() near 0% throughout, isolating the count-based path.
+  {
+    EventJournalIndex idx(100000000);
+    for (uint32_t i = 0; i < EventJournalIndex::kMaxInMemoryJournalRecords; ++i) {
+      JournalRecord r = make_record("evt-count-" + std::to_string(i));
+      idx.record_appended_event(r, 10);
+    }
+    check(!idx.should_consider_compaction(),
+          "exactly kMaxInMemoryJournalRecords records, negligible byte usage -- not yet over the count bound");
+    JournalRecord over = make_record("evt-count-over");
+    idx.record_appended_event(over, 10);
+    check(idx.should_consider_compaction(),
+          "one more than kMaxInMemoryJournalRecords -- count bound alone urges compaction despite ~0% byte usage");
+  }
+
   // --- pending_in_device_seq_order() (2026-08-26, Phase 3B real offline
   // replay, §17/§19) ---
   {

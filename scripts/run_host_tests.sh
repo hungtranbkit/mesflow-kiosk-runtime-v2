@@ -67,6 +67,9 @@ for test_src in test/host/test_*.cpp; do
     test_environment_label)
       extra_srcs=(firmware/kiosk_runtime_v2/src/protocol/environment_label.cpp)
       ;;
+    test_network_state)
+      extra_srcs=(firmware/kiosk_runtime_v2/src/network/network_state.cpp)
+      ;;
   esac
 
   echo "--- $name ---"

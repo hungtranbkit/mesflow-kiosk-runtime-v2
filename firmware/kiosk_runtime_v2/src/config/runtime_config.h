@@ -75,6 +75,22 @@
 
 // Scanner physical-duplicate suppression window. Not a business dedupe
 // window — just "the same physical swipe read twice" (§26).
+//
+// 2026-08-27 field report, corrected same day: this was briefly raised to
+// 4000ms to fight a suspected scanner double-read auto-advancing straight
+// to quantity input after only one real employee-card tap. That larger
+// window turned out to be the wrong layer AND actively harmful: real
+// operators regularly re-tap the same card within 1-2s (well under 4000ms)
+// as a genuine, deliberate second action, and now that tap was silently
+// swallowed as a "duplicate" -- producing the exact "scan, long wait,
+// nothing happens" complaint the operator then reported. The actual root
+// cause of the original bug was a kiosk_v2.py business-flow issue (an
+// employee scan resolving to an open session required TWO taps -- an
+// info-only SESSION_ACTIVE screen, then a second tap to reach
+// QUANTITY_INPUT -- fixed there directly: one tap now goes straight to
+// QUANTITY_INPUT). Restored to 1500ms -- the previously-established,
+// field-tested value -- now that the real flow no longer depends on two
+// same-card taps landing far enough apart to escape a longer window.
 #define SCANNER_DUPLICATE_SUPPRESS_MS 1500
 
 // Wi-Fi connect attempt timeout before wifi_manager reports DISCONNECTED
