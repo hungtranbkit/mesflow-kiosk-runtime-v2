@@ -25,8 +25,10 @@
 #include "src/hardware/keypad_pcf8574.h"
 #include "src/hardware/scanner_gm65.h"
 #include "src/network/bootstrap_client.h"
+#include "src/network/endpoint_utils.h"
 #include "src/network/heartbeat_client.h"
 #include "src/network/net_diag.h"
+#include "src/network/network_worker.h"
 #include "src/network/time_sync.h"
 #include "src/network/wifi_manager.h"
 #include "src/network/wifi_setup_portal.h"
@@ -68,9 +70,16 @@ kiosk::storage::UiBundleStore g_ui_bundle_store;
 // 3A report for the real measured SPIFFS numbers this was sized against.
 constexpr uint32_t kJournalCapacityBytes = 256u * 1024u;
 kiosk::storage::EventJournal g_journal;
+// Single persistent network worker (2026-08-26 "eliminate recurrent server
+// connection failures" pass, §2-§5) -- ONE FreeRTOS task for the whole
+// device's lifetime, created once by begin() in setup() below. Declared
+// here (not inside KioskRuntime) so it can eventually also be shared by
+// HeartbeatClient/BootstrapClient once those are migrated onto it too
+// (pending work -- see network_worker.h's own header comment).
+kiosk::network::NetworkWorker g_network_worker;
 kiosk::runtime::KioskRuntime g_runtime(g_bus, g_renderer, g_config, g_identity, g_time_sync, g_ui_bundle_store,
-                                       g_journal);
-kiosk::runtime::UiSyncController g_ui_sync(g_ui_bundle_store);
+                                       g_journal, g_network_worker);
+kiosk::runtime::UiSyncController g_ui_sync(g_ui_bundle_store, g_runtime);
 // §4 of the 2026-08-25 finish-anti-stuck-recovery follow-up -- the recovery
 // menu's "RETRY NETWORK"/"RESYNC" actions forwarded in as callbacks (see
 // WifiRecoveryController's own header comment for why: it must not depend
@@ -111,14 +120,14 @@ kiosk::hardware::SelfTestResult g_selftest;
 kiosk::runtime::BootDiagnostics g_diagnostics;
 
 kiosk::network::HeartbeatClient g_heartbeat(g_identity, g_time_sync, g_runtime, g_keypad, g_selftest,
-                                            g_diagnostics, g_bootstrap);
+                                            g_diagnostics, g_bootstrap, g_network_worker, g_wifi);
 
 #if MESFLOW_DEBUG_API
 // Constructed after g_selftest/g_diagnostics exist (it holds a reference to
 // them) but only actually started in setup() once they've been populated.
 kiosk::debug::DebugServer g_debug_server(g_bus, g_display, g_renderer, g_runtime, g_keypad,
                                           g_selftest, g_diagnostics, g_identity, g_time_sync,
-                                          g_bootstrap, g_ui_bundle_store, g_ui_sync);
+                                          g_bootstrap, g_ui_bundle_store, g_ui_sync, g_wifi);
 #endif
 
 unsigned long g_last_diagnostics_print_ms = 0;
@@ -160,21 +169,29 @@ constexpr unsigned long kLowMemoryCheckIntervalMs = 1000;
 uint32_t g_consecutive_critical_low_memory_checks = 0;
 constexpr uint32_t kCriticalRebootPatienceChecks = 10;
 
-// Network self-recovery (2026-08-26 field report): see
-// KioskRuntime::consecutive_tcp_connect_fail()'s and
-// WifiManager::force_reconnect()'s own doc comments for the full
-// root-cause writeup -- reproduced live, twice, with only a manual reboot
-// recovering it. RECONNECT is tried first (cheap, ~instant, the same path
-// a genuine Wi-Fi drop already takes); REBOOT only escalates if THAT
-// streak keeps going, mirroring the existing LOW_MEMORY supervisor's own
-// "try the cheap fix, escalate only if it didn't work" shape.
-// g_network_reconnect_attempted_this_streak prevents calling
-// force_reconnect() again on every single subsequent failure once one has
-// already been triggered for this streak -- it's cleared the moment the
-// streak itself clears (a success, or a differently-classified failure).
+// Network self-recovery (2026-08-26 field report; reboot escalation
+// REMOVED 2026-08-26 "eliminate recurrent server connection failures" pass
+// -- see kNetworkStuckReconnectThreshold's own comment below). RECONNECT
+// (WifiManager::force_reconnect() -- a plain disconnect+fresh WiFi.begin(),
+// the SAME path a genuine drop already takes) is retried every
+// kNetworkStuckReconnectRepeatEvery consecutive TCP_CONNECT_FAIL events,
+// FOREVER -- there is deliberately NO reboot escalation for this condition
+// anymore. Explicit instruction from this task: "Do not solve this by
+// rebooting/resetting the ESP when a request fails. The runtime must
+// recover networking in-place and remain usable" -- DNS_FAIL/
+// TCP_CONNECT_FAIL/HTTP_TIMEOUT/HTTP_5XX are all recoverable operating
+// conditions, never a reboot condition. A previous round DID escalate to
+// reboot after a fixed number of failed reconnects; that is the exact
+// policy this removes. g_network_reconnect_attempted_this_streak still
+// prevents calling force_reconnect() on every single failure within one
+// repeat window -- cleared the moment the streak itself clears (a success,
+// or a differently-classified failure).
 constexpr uint32_t kNetworkStuckReconnectThreshold = 2;
-constexpr uint32_t kNetworkStuckRebootThreshold = 5;
-bool g_network_reconnect_attempted_this_streak = false;
+constexpr uint32_t kNetworkStuckReconnectRepeatEvery = 3;
+// 0 means "no reconnect fired yet this streak" -- otherwise the streak
+// value AT which the most recent reconnect fired, so the next one is due
+// once the streak has grown by kNetworkStuckReconnectRepeatEvery beyond it.
+uint32_t g_last_reconnect_at_streak = 0;
 
 // §6 of the 2026-08-25 finish-anti-stuck-recovery follow-up: lightweight UI
 // stall detection. g_display.frame_id() (bumped once per Renderer::end_screen()
@@ -209,6 +226,11 @@ constexpr unsigned long kCompactionCheckIntervalMs = 30000;
 bool g_compaction_was_active = false;
 
 bool g_bootstrap_attempted = false;
+// 2026-08-27: true from the moment a bootstrap request is enqueued through
+// NetworkWorker until its async result is picked up -- see the enqueue
+// site's own comment for why this exists (distinguishes "already asked,
+// waiting" from "done, or free to try again" now that the call is async).
+bool g_bootstrap_inflight = false;
 bool g_time_sync_started = false;
 
 // Real race found live (2026-08-24): WiFi.status()==WL_CONNECTED can flip
@@ -224,7 +246,24 @@ bool g_time_sync_started = false;
 // -- only a TRANSPORT-level failure (BootstrapStatus::FAILED) retries;
 // a real response (OK or a business REJECTED) still marks this done
 // immediately, same as before.
-constexpr int kBootstrapMaxAttempts = 5;
+//
+// Lowered from 5 -> 2 (2026-08-27, real field report same day as the DHCP
+// race fix's own original bug): BootstrapClient::attempt() is STILL a
+// single fully-SYNCHRONOUS HTTPClient call on the main loop() thread (never
+// migrated onto NetworkWorker) -- each attempt can block loop() for up to
+// RUNTIME_HTTP_TIMEOUT_MS (2.5s), during which the keypad/scanner are never
+// polled at all. This retry loop re-arms on EVERY WiFi reconnect (see
+// g_last_seen_reconnect_count below), including the pre-existing (not new
+// today) consecutive_tcp_connect_fail_ -> force_reconnect() self-heal path.
+// At 5 attempts x (up to 2.5s block + 3s cooldown), a single reconnect
+// could cost up to ~27.5s of intermittent-but-real UI unresponsiveness --
+// closely matching a live report of "quét thẻ báo nhận mã rồi treo ~30s".
+// 2 attempts (one real retry, for the DHCP race above) caps the worst case
+// at ~8s while still covering that original bug. The real architectural
+// fix -- migrating BootstrapClient onto NetworkWorker so it never blocks
+// loop() at all -- is a bigger change, flagged separately, not done here
+// under time pressure.
+constexpr int kBootstrapMaxAttempts = 2;
 constexpr unsigned long kBootstrapRetryCooldownMs = 3000;
 int g_bootstrap_attempt_count = 0;
 unsigned long g_bootstrap_next_attempt_ms = 0;
@@ -284,6 +323,15 @@ void setup() {
   g_journal.init(kJournalCapacityBytes);  // Phase 3A: recovers the durable event journal's index (SPIFFS-backed, shadow mode)
 #if MESFLOW_DEBUG_API
   kiosk::health::log_memory_snapshot("AFTER_JOURNAL_INIT");
+#endif
+
+  // §2 of the 2026-08-26 "eliminate recurrent server connection failures"
+  // pass: create the ONE persistent network worker task now, before
+  // anything below can possibly try to send/fetch anything through it.
+  // Never created again for the rest of this boot.
+  g_network_worker.begin();
+#if MESFLOW_DEBUG_API
+  kiosk::health::log_memory_snapshot("AFTER_NETWORK_WORKER_BEGIN");
 #endif
 
   String boot_id = kiosk::protocol::generate_random_hex_id(8).c_str();
@@ -777,6 +825,16 @@ void poll_serial_provisioning() {
         g_debug_server.write_device_state_serial(Serial);
       } else if (line == "debug-net-diag") {
         kiosk::network::run_net_diag(Serial, g_wifi.reconnect_count());
+      } else if (line == "debug-wifi-drop") {
+        // §1 of the 2026-08-27 "Final Field-Readiness Verification" pass:
+        // exercises the REAL WifiManager recovery path (poll()'s own
+        // CONNECTED -> DISCONNECTED -> cooldown -> CONNECTING -> CONNECTED
+        // cycle) without needing physical AP control. Does NOT touch
+        // persisted Wi-Fi credentials (config_store/NVS) at all -- see
+        // WifiManager::simulate_disconnect_for_test()'s own comment.
+        g_wifi.simulate_disconnect_for_test();
+        Serial.println("{\"level\":\"WARN\",\"code\":\"NET_WIFI_TEST_DROP_ARMED\",\"module\":\"kiosk_runtime_v2\","
+                       "\"message\":\"radio disconnected for testing -- watch for the normal reconnect cycle\"}");
       } else if (line.startsWith("debug-input:")) {
         // Same SCAN/KEY_DOWN/KEY_UP JSON body as POST /debug/input, e.g.
         // debug-input:{"type":"SCAN","value":"00152"} -- needed to drive
@@ -784,17 +842,19 @@ void poll_serial_provisioning() {
         // HTTP path to the device and no physical scanner/keypad access.
         g_debug_server.write_input_result_serial(std::string(line.substring(12).c_str()), Serial);
       } else if (line == "force-task-create-failure") {
-        // §8 of the 2026-08-25 finish-anti-stuck-recovery follow-up: makes
-        // the NEXT event send's xTaskCreate() fail exactly like a real
-        // API_ERR_TASK_CREATE_FAILED, so kiosk_runtime.cpp's retry-once ->
-        // controlled-reboot recovery path can be exercised and proven on
-        // real hardware without needing to actually exhaust internal SRAM.
-        // Reproducible/automatable: tools/kiosk_test_runner.py's
-        // --mode targeted --scenario task_create_failure sends this over
-        // serial, then drives a scan and checks the recovery outcome.
-        g_runtime.force_next_task_create_failure_for_test();
-        Serial.println("{\"level\":\"INFO\",\"code\":\"API_FAULT_ARMED\",\"module\":\"kiosk_runtime_v2\","
-                       "\"message\":\"next event send's xTaskCreate will be forced to fail\"}");
+        // OBSOLETE as of the 2026-08-26 "eliminate recurrent server
+        // connection failures" pass (§2-§5): there is no more per-call
+        // xTaskCreate() to fail -- NetworkWorker's one task is created once,
+        // at boot, by begin(). The scenario this command used to arm
+        // (KioskRuntime::force_next_task_create_failure_for_test(), and its
+        // whole retry-once -> controlled-reboot path) no longer exists.
+        // Kept as a recognized-but-inert command (rather than silently
+        // falling through to "unknown command") so an old
+        // tools/kiosk_test_runner.py --scenario task_create_failure run
+        // gets an honest answer instead of a confusing timeout.
+        Serial.println("{\"level\":\"WARN\",\"code\":\"API_FAULT_OBSOLETE\",\"module\":\"kiosk_runtime_v2\","
+                       "\"message\":\"force-task-create-failure is obsolete -- NetworkWorker has no "
+                       "per-call task creation left to fail\"}");
       } else if (line.startsWith("simulate-compaction-crash:")) {
         // §10 of the 2026-08-25 follow-up: sets up the exact on-disk file
         // state a real crash would leave at one of compact()'s 5
@@ -848,27 +908,23 @@ void loop() {
 #endif
 
   // Network self-recovery -- see kNetworkStuckReconnectThreshold's own
-  // comment above for the full context.
+  // comment above for the full context. NO reboot escalation: if the
+  // streak keeps growing past the first reconnect, just keep reconnecting
+  // every kNetworkStuckReconnectRepeatEvery failures, indefinitely -- the
+  // device stays usable and keeps trying, exactly as this task requires.
   {
     uint32_t streak = g_runtime.consecutive_tcp_connect_fail();
     if (streak == 0) {
-      g_network_reconnect_attempted_this_streak = false;
-    } else if (streak == kNetworkStuckReconnectThreshold && !g_network_reconnect_attempted_this_streak) {
-      g_network_reconnect_attempted_this_streak = true;
+      g_last_reconnect_at_streak = 0;
+    } else if (streak >= kNetworkStuckReconnectThreshold &&
+              streak - g_last_reconnect_at_streak >=
+                  (g_last_reconnect_at_streak == 0 ? kNetworkStuckReconnectThreshold
+                                                   : kNetworkStuckReconnectRepeatEvery)) {
+      g_last_reconnect_at_streak = streak;
       kiosk::health::record_recovery_event(
           kiosk::health::RecoveryCode::NETWORK_TIMEOUT,
           "sustained TCP_CONNECT_FAIL despite Wi-Fi CONNECTED -- forcing reconnect", 0, 0, 0);
       g_wifi.force_reconnect();
-    } else if (streak >= kNetworkStuckRebootThreshold) {
-      // The forced reconnect above didn't help (the streak kept growing
-      // past it) -- escalate the same way LOW_MEMORY does when its own
-      // cheap fix doesn't recover things either.
-      kiosk::health::request_controlled_reboot(
-          kiosk::health::RecoveryCode::NETWORK_TIMEOUT,
-          "forced Wi-Fi reconnect did not recover TCP connectivity", static_cast<uint8_t>(g_journal.pressure()),
-          static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-          static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
-      // never returns.
     }
   }
 
@@ -881,6 +937,7 @@ void loop() {
     if (reconnects != g_last_seen_reconnect_count) {
       g_last_seen_reconnect_count = reconnects;
       g_bootstrap_attempted = false;
+      g_bootstrap_inflight = false;
       g_bootstrap_attempt_count = 0;
       g_bootstrap_next_attempt_ms = 0;
       kiosk::health::log_structured(
@@ -899,18 +956,70 @@ void loop() {
     }
     g_time_sync.poll();
 
-    if (!g_bootstrap_attempted && millis() >= g_bootstrap_next_attempt_ms) {
-      ++g_bootstrap_attempt_count;
+    // 2026-08-27 field report ("máy quét phải luôn sẵn sàng" -- the kiosk
+    // must always be ready): this used to call g_bootstrap.attempt()
+    // directly here, a single BLOCKING HTTPClient POST on this same loop()
+    // thread -- up to RUNTIME_HTTP_TIMEOUT_MS per attempt, during which the
+    // keypad/scanner were never polled at all. Every other request kind
+    // already moved off loop()-blocking calls via NetworkWorker; this was
+    // the one left over. Now enqueues through the SAME worker every other
+    // request kind uses and picks the result up on a LATER loop() iteration
+    // via take_bootstrap_result() -- g_bootstrap_inflight distinguishes
+    // "already asked, waiting for the async result" from "done, or free to
+    // try again", so this enqueue check never fires twice for the same
+    // attempt.
+    if (!g_bootstrap_attempted && !g_bootstrap_inflight && millis() >= g_bootstrap_next_attempt_ms) {
+      String bootstrap_url = kiosk::network::derive_sibling_endpoint(g_config.api_endpoint(), "bootstrap");
+      if (bootstrap_url.length() == 0) {
+        // Can't even derive the endpoint -- same "count it as a real
+        // attempt so this doesn't spin forever" treatment the old blocking
+        // path gave an equivalent failure, just without ever touching the
+        // network at all.
+        ++g_bootstrap_attempt_count;
+        kiosk::health::log_structured("ERROR", "BOOTSTRAP_REJECTED", "kiosk_runtime_v2",
+                                      "could not derive /bootstrap endpoint from configured URL");
+        if (g_bootstrap_attempt_count >= kBootstrapMaxAttempts) {
+          g_bootstrap_attempted = true;
+          kiosk::network::BootstrapResult failed;
+          failed.status = kiosk::network::BootstrapStatus::FAILED;
+          g_runtime.on_bootstrap_result(failed);
+        } else {
+          g_bootstrap_next_attempt_ms = millis() + kBootstrapRetryCooldownMs;
+        }
+      } else {
+        std::string body = kiosk::network::BootstrapClient::build_request_body(
+            g_identity.device_id(), g_identity.hardware_id(), g_diagnostics.boot_id,
+            static_cast<uint32_t>(g_runtime.device_seq()));
 #if MESFLOW_DEBUG_API
-      kiosk::health::log_memory_snapshot("BEFORE_TLS_REQUEST");
+        kiosk::health::log_memory_snapshot("BEFORE_TLS_REQUEST");
 #endif
-      auto bootstrap_result =
-          g_bootstrap.attempt(g_config.api_endpoint(), g_identity.device_id(), g_identity.hardware_id(),
-                              g_diagnostics.boot_id, static_cast<uint32_t>(g_runtime.device_seq()));
+        if (g_runtime.enqueue_bootstrap(bootstrap_url, body)) {
+          ++g_bootstrap_attempt_count;
+          g_bootstrap_inflight = true;
+        }
+        // If enqueue fails (HIGH-tier queue momentarily full, e.g. a
+        // foreground scan just ahead of it), simply try again the very
+        // next loop() iteration -- no attempt consumed, no cooldown, and
+        // certainly no blocking wait either way.
+      }
+    }
+
+    // Picked up on whatever LATER loop() iteration the async bootstrap
+    // request actually completes on -- decoupled from the "should a NEW
+    // attempt start" check above by design (see g_bootstrap_inflight).
+    kiosk::network::NetworkResult bootstrap_net_result;
+    if (g_runtime.take_bootstrap_result(bootstrap_net_result)) {
+      g_bootstrap_inflight = false;
 #if MESFLOW_DEBUG_API
+      // These two snapshots now bracket the full async round trip (enqueue
+      // to result), not a single blocking call the way they used to --
+      // still useful as "cost of a bootstrap cycle", just a wall-clock
+      // window instead of a pure CPU-blocked one.
       kiosk::health::log_memory_snapshot("AFTER_TLS_REQUEST");
       if (g_bootstrap_attempt_count == 1) kiosk::health::log_memory_snapshot("AFTER_FIRST_BOOTSTRAP");
 #endif
+      auto bootstrap_result = g_bootstrap.parse_response(bootstrap_net_result.outcome.http_status,
+                                                         bootstrap_net_result.response_body);
       if (bootstrap_result.status == kiosk::network::BootstrapStatus::FAILED &&
           g_bootstrap_attempt_count < kBootstrapMaxAttempts) {
         // Transport-level failure (see the race documented above) -- retry
@@ -1154,31 +1263,30 @@ void loop() {
   // report): loop() ran with NO cooperative yield at all -- every iteration
   // of this function returns immediately back into Arduino's own loopTask,
   // which itself runs at priority 1 (tskIDLE_PRIORITY + 1), the SAME
-  // priority AsyncEventSender's/HeartbeatClient's own worker tasks use
-  // (api_client.cpp's send_task_entry, heartbeat_client.cpp's
-  // heartbeat_task_entry -- both end with vTaskDelete(nullptr), a SELF-
-  // deletion). FreeRTOS documents that a task's own stack/TCB cannot be
-  // freed while it's still the one executing -- that memory is only
+  // priority the OLD AsyncEventSender's/HeartbeatClient's own per-call
+  // worker tasks used (api_client.cpp's send_task_entry, heartbeat_client
+  // .cpp's heartbeat_task_entry -- both ended with vTaskDelete(nullptr), a
+  // SELF-deletion). FreeRTOS documents that a task's own stack/TCB cannot
+  // be freed while it's still the one executing -- that memory is only
   // actually reclaimed later, by the IDLE task (priority 0, strictly
   // BELOW 1) running and doing the cleanup. With loopTask never yielding,
   // and worker tasks spawned on every scan (plus every 20s for heartbeat)
   // also sitting at priority 1, the priority-0 idle task on whichever core
-  // these land on can be starved of scheduling time for long stretches --
-  // self-deleted tasks pile up unreclaimed, internal SRAM drops
+  // these land on could be starved of scheduling time for long stretches --
+  // self-deleted tasks piled up unreclaimed, internal SRAM dropped
   // (confirmed live: int_free fell from ~180KB to ~9KB over ~110s of
   // repeated scans, while int_largest independently collapsed to 6644
   // bytes -- just under a new task's required stack allocation), and the
-  // next xTaskCreate() call fails -- exactly the existing, correct
-  // RECOVERY_TASK_CREATE_FAILED controlled-reboot path this project already
-  // has for that failure mode (kiosk_runtime.cpp's check_send_retry()).
-  // This isn't a bug in that recovery path -- it did its job, rebooting
-  // cleanly rather than wedging -- the bug is upstream: nothing ever gave
-  // idle task a chance to keep up. A single 1-tick (~1ms at the default
-  // 1000Hz tick rate) delay here is the standard, minimal-risk fix for
-  // exactly this FreeRTOS pattern -- negligible next to this loop's own
-  // per-iteration work and the hundreds-of-ms network latencies already
-  // involved, but it guarantees idle (and any other equal-priority task)
-  // gets scheduled at least once per loop() cycle instead of potentially
-  // never.
+  // next xTaskCreate() call failed.
+  //
+  // The 2026-08-26 "eliminate recurrent server connection failures" pass
+  // (§2-§5) removed the per-call task pattern entirely -- NetworkWorker
+  // creates exactly ONE task, once, at boot (g_network_worker.begin() in
+  // setup()), so there is no more per-scan/per-heartbeat task creation left
+  // to starve the idle task or fail. This vTaskDelay(1) is kept anyway: it
+  // is still the correct, standard, minimal-risk cooperative yield for
+  // loopTask relative to NetworkWorker's own persistent task and any other
+  // equal-priority task on this chip, and costs nothing next to this loop's
+  // own per-iteration work.
   vTaskDelay(1);
 }

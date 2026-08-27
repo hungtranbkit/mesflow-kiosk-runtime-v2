@@ -6,6 +6,7 @@
 #include "../hardware/keypad_pcf8574.h"
 #include "../network/bootstrap_client.h"
 #include "../network/time_sync.h"
+#include "../network/wifi_manager.h"
 #include "../security/device_identity.h"
 #include "boot_diagnostics.h"
 #include "kiosk_runtime.h"
@@ -25,6 +26,7 @@ std::string build_status_json(kiosk::security::DeviceIdentity& identity,
                               kiosk::hardware::KeypadPcf8574& keypad,
                               const kiosk::hardware::SelfTestResult& selftest,
                               BootDiagnostics& diagnostics,
-                              const kiosk::network::BootstrapClient& bootstrap);
+                              const kiosk::network::BootstrapClient& bootstrap,
+                              const kiosk::network::WifiManager& wifi);
 
 }  // namespace kiosk::runtime

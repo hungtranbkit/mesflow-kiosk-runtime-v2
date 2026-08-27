@@ -51,6 +51,15 @@ int main() {
     auto forbidden = classify_http_result(403);
     check(!forbidden.retryable, "403 -> not retryable");
 
+    // §2 of the 2026-08-27 "Final Reliability Standardization" pass: 409
+    // (idempotency payload-mismatch, app/mesflow/web/kiosk_v2.py's
+    // IDEMPOTENCY_KEY_REUSE_MISMATCH) must never be retried blindly --
+    // confirmed here explicitly rather than relying on the generic 4xx
+    // bucket test above to imply it.
+    auto conflict = classify_http_result(409);
+    check(!conflict.retryable && conflict.error_code == "HTTP_4XX",
+          "409 -> HTTP_4XX, NOT retryable (idempotency payload mismatch must not retry forever)");
+
     auto server_error = classify_http_result(500);
     check(server_error.retryable && server_error.error_code == "HTTP_5XX",
           "500 -> HTTP_5XX, retryable");

@@ -11,7 +11,7 @@ namespace kiosk::runtime {
 void UiSyncController::check_desired(const String& base_events_url, uint32_t desired_version,
                                      const std::string& desired_hash) {
   last_desired_version_ = desired_version;
-  if (fetcher_.busy()) return;  // a download/resync is already in flight; try again next cycle
+  if (download_in_flight_) return;  // a download is already in flight; try again next cycle
 
   bool needs_sync = kiosk::protocol::ui_bundle_needs_sync(
       store_.active_version(), std::string(store_.active_hash().c_str()), desired_version, desired_hash);
@@ -30,20 +30,23 @@ void UiSyncController::check_desired(const String& base_events_url, uint32_t des
 
   pending_version_ = desired_version;
   store_.set_sync_state(kiosk::storage::UiSyncState::DOWNLOADING);
-  bool started = fetcher_.fetch(url);
+  bool started = runtime_.enqueue_ui_bundle_fetch(url);
+  download_in_flight_ = started;  // a false enqueue (queue full) leaves it not-in-flight -- next
+                                  // check_desired() cycle (bootstrap/heartbeat) naturally retries
   kiosk::health::log_structured(started ? "INFO" : "WARN", "UI_UPDATE_DOWNLOAD_START", "ui_sync_controller",
                                 url.c_str());
 }
 
 bool UiSyncController::poll() {
-  kiosk::network::StateFetchOutcome result;
-  if (!fetcher_.poll(result)) return false;
+  kiosk::network::NetworkResult result;
+  if (!runtime_.take_ui_bundle_fetch_result(result)) return false;
+  download_in_flight_ = false;
 
-  if (!result.ok || result.response_body.empty()) {
+  if (!result.outcome.ok || result.response_body.empty()) {
     store_.set_sync_state(kiosk::storage::UiSyncState::UPDATE_FAILED);
     kiosk::health::log_structured(
         "WARN", "UI_UPDATE_DOWNLOAD_FAILED", "ui_sync_controller",
-        (std::string("http_status=") + std::to_string(result.http_status)).c_str());
+        (std::string("http_status=") + std::to_string(result.outcome.http_status)).c_str());
     // §25: continue using whatever is currently active -- no partial
     // state, no retry storm here; check_desired() will naturally try again
     // on the next bootstrap/heartbeat cycle.

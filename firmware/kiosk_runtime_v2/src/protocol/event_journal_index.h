@@ -140,10 +140,27 @@ class EventJournalIndex {
   // encode_journal_event() will serialize).
   void rebuild_after_compaction(const std::vector<std::string>& keep_event_ids);
 
+  // §6 of the 2026-08-27 "Final Runtime Closure" pass: a hard, COUNT-based
+  // safety bound alongside the existing byte-percentage one. Real gap
+  // found live during that pass's own stress testing: a burst of many
+  // SMALL records (SCAN/CANCEL events have compact JSON bodies) can push
+  // record_count() well past 100 while usage_pct() is still comfortably
+  // under the 70% WARNING threshold below -- bytes and item count don't
+  // move together when payload sizes vary, so a byte-only trigger can miss
+  // a genuine "too many records sitting in RAM" situation. This does NOT
+  // change what compaction keeps (CompactionPolicy's own per-status
+  // retention counts are unaffected, and PENDING/IN_FLIGHT are still never
+  // dropped) -- it only makes compaction START sooner when record COUNT
+  // alone is already high, independent of byte usage.
+  static constexpr uint32_t kMaxInMemoryJournalRecords = 120;
+
   // True if usage has crossed a threshold where compaction is worth
   // attempting at all (matches journal_pressure_for_usage()'s own
-  // WARNING/70% boundary -- see §3 of the self-recovery task).
-  bool should_consider_compaction() const { return usage_pct() >= 70.0; }
+  // WARNING/70% boundary -- see §3 of the self-recovery task -- OR the
+  // record-count bound above, whichever fires first).
+  bool should_consider_compaction() const {
+    return usage_pct() >= 70.0 || record_count() > kMaxInMemoryJournalRecords;
+  }
 
   uint32_t used_bytes() const { return used_bytes_; }
   uint32_t capacity_bytes() const { return capacity_bytes_; }

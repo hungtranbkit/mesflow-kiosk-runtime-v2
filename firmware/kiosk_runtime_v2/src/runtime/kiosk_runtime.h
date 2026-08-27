@@ -5,9 +5,9 @@
 #include <string>
 #include <vector>
 
-#include "../network/api_client.h"
 #include "../network/bootstrap_client.h"
-#include "../network/state_client.h"
+#include "../network/network_state.h"
+#include "../network/network_worker.h"
 #include "../network/time_sync.h"
 #include "../protocol/event_response.h"
 #include "../protocol/ids.h"
@@ -37,6 +37,19 @@ enum class QtyStep {
   DEFECT,           // "SAN PHAM LOI" -- after GOOD confirmed
   REWORK_DECISION,  // "LOI CO SUA DUOC KHONG?" -- only reached if DEFECT > 0
   REWORK,           // "SO LUONG CAN SUA" -- only reached if repairable == YES
+  // Real field report (2026-08-27): all three "done entering" paths below
+  // (DEFECT==0, REWORK_DECISION's "2 KHONG", REWORK's own '#') used to call
+  // submit_final_quantity() immediately -- the operator had no chance to
+  // review what they'd just typed before it was already sent and the kiosk
+  // had moved on to the next employee's scan screen. SUMMARY shows the
+  // final GOOD/DEFECT/REWORK values and requires an explicit confirm
+  // keypress before the real submit fires; '*' from here restarts the
+  // whole local entry (see reset_quantity_flow()) instead of trying to
+  // rewind to one specific earlier step -- deliberately simple: the values
+  // involved are small enough that a full re-entry costs the operator a
+  // few seconds, and a partial-rewind state machine would be real added
+  // complexity for a case (a mis-typed digit) that doesn't need it.
+  SUMMARY,
 };
 
 // Phase 2: "SERVER OWNS BUSINESS STATE" (docs/ARCHITECTURE.md invariants
@@ -58,14 +71,16 @@ class KioskRuntime {
  public:
   KioskRuntime(EventBus& bus, kiosk::ui::Renderer& renderer, kiosk::storage::ConfigStore& config,
                kiosk::security::DeviceIdentity& identity, kiosk::network::TimeSync& time_sync,
-               kiosk::storage::UiBundleStore& ui_bundle_store, kiosk::storage::EventJournal& journal)
+               kiosk::storage::UiBundleStore& ui_bundle_store, kiosk::storage::EventJournal& journal,
+               kiosk::network::NetworkWorker& network)
       : bus_(bus),
         renderer_(renderer),
         config_(config),
         identity_(identity),
         time_sync_(time_sync),
         ui_bundle_store_(ui_bundle_store),
-        journal_(journal) {}
+        journal_(journal),
+        network_(network) {}
 
   // `boot_id` is generated once in the .ino entry point and shared with
   // boot_diagnostics, so the diagnostics screen and every protocol event
@@ -87,6 +102,47 @@ class KioskRuntime {
   // restores a locally-remembered business state across reboot -- it always
   // starts fresh from whatever the server says this boot).
   void on_bootstrap_result(const kiosk::network::BootstrapResult& result);
+
+  // Real field report (2026-08-27, "máy quét phải luôn sẵn sàng"): bootstrap
+  // used to run as a single blocking HTTPClient call directly on the .ino's
+  // loop() thread -- the one request kind NetworkWorker's original migration
+  // left out, and the one that could still stall the keypad/scanner for
+  // seconds at a time on every WiFi reconnect. These two methods let the
+  // .ino drive bootstrap through NetworkWorker like every other request
+  // kind instead: enqueue_bootstrap() is a thin passthrough (kept here
+  // rather than exposing network_ directly, so this class stays the one
+  // place that owns the worker reference), and take_bootstrap_result()
+  // hands back exactly one completed BOOTSTRAP NetworkResult per call,
+  // mirroring poll()'s own "exactly once per completed request" contract --
+  // poll() itself stashes it here instead of consuming it, since bootstrap's
+  // retry/cooldown bookkeeping lives in the .ino, not in this class.
+  bool enqueue_bootstrap(const String& url, const std::string& body) {
+    return network_.enqueue_bootstrap(url, body);
+  }
+  bool take_bootstrap_result(kiosk::network::NetworkResult& out) {
+    if (!bootstrap_result_ready_) return false;
+    out = pending_bootstrap_result_;
+    bootstrap_result_ready_ = false;
+    return true;
+  }
+
+  // Same shape as enqueue_bootstrap()/take_bootstrap_result() immediately
+  // above, for UiSyncController's UI-bundle download (2026-08-27 "close
+  // final two runtime gaps" pass -- the last per-call xTaskCreate site,
+  // state_client.cpp's AsyncStateFetcher). UiSyncController has no direct
+  // access to network_ (only KioskRuntime owns that reference), and only
+  // ONE piece of code may ever call network_.poll() itself (a single
+  // mutex-protected result slot shared by every request kind) -- so this
+  // class's own poll() (the sole caller) stashes a completed
+  // UI_BUNDLE_FETCH result here for UiSyncController to collect next loop,
+  // exactly like it already does for BOOTSTRAP.
+  bool enqueue_ui_bundle_fetch(const String& url) { return network_.enqueue_ui_bundle_fetch(url); }
+  bool take_ui_bundle_fetch_result(kiosk::network::NetworkResult& out) {
+    if (!ui_bundle_fetch_result_ready_) return false;
+    out = pending_ui_bundle_fetch_result_;
+    ui_bundle_fetch_result_ready_ = false;
+    return true;
+  }
 
   // Re-renders whichever screen is currently correct: the current
   // authoritative business-state screen if StateProjection has a snapshot
@@ -115,16 +171,13 @@ class KioskRuntime {
   int last_retry_count() const { return last_retry_count_; }
   // Request-priority policy (simplicity/memory pass, 2026-08-26):
   // "foreground scan > critical reconnect/bootstrap > offline replay >
-  // heartbeat > background refresh." check_offline_replay() already
-  // deferred to a live send (sender_.busy()||send_retry_pending_) --
-  // HeartbeatClient did NOT, a real gap found auditing this file for that
-  // exact policy: a heartbeat could start its own HTTPClient POST at the
-  // same moment a foreground scan's own send was already in flight, two
-  // concurrent HTTP operations competing for heap/sockets with no
-  // correctness need to. Exposed here so HeartbeatClient::poll() (which
-  // already holds a KioskRuntime& reference) can defer for one cycle
-  // instead.
-  bool network_busy() const { return sender_.busy() || send_retry_pending_; }
+  // heartbeat > background refresh." Now backed directly by
+  // NetworkWorker::high_priority_busy() -- the worker's own two-tier queue
+  // (HIGH always drained before LOW) enforces this by construction; this
+  // accessor exists so HeartbeatClient::poll() (which already holds a
+  // KioskRuntime& reference) can additionally choose to skip a whole cycle
+  // rather than even enqueue into the LOW tier while HIGH traffic exists.
+  bool network_busy() const { return network_.high_priority_busy(); }
   // Network self-recovery (2026-08-26 field report: TCP_CONNECT_FAIL
   // persisting across every send despite WiFi.status()==WL_CONNECTED and
   // the backend verified healthy from elsewhere -- reproduced twice live,
@@ -140,10 +193,36 @@ class KioskRuntime {
   // on them itself (see WifiRecoveryController's own forwarding methods).
   uint32_t consecutive_tcp_connect_fail() const { return consecutive_tcp_connect_fail_; }
 
+  // §8 of the 2026-08-27 "Final Runtime Closure" pass: the small explicit
+  // ONLINE/DEGRADED/OFFLINE_WIFI/OFFLINE_SERVER/AUTH_BLOCKED classification
+  // -- a pure function of facts already tracked above (wifi_indicator_,
+  // last_backend_ok_, last_http_status_, consecutive_request_failures_),
+  // computed fresh on demand rather than stored/transitioned as its own
+  // state machine. Used by /debug/device-state and structured field logs;
+  // deliberately NOT wired into the physical status bar's layout this pass
+  // (a rendering change on a real display can't be verified without eyes
+  // on the actual screen -- see the final report's own note on this).
+  kiosk::network::NetworkState network_state() const {
+    kiosk::network::NetworkStateInputs in;
+    in.wifi_connected = wifi_indicator_ == kiosk::ui::WifiIndicator::CONNECTED;
+    // has_scanned_ guards last_backend_ok_'s own false-by-default initial
+    // value -- before this boot has completed even one request, there is
+    // nothing to be wrong about yet (matches classify_network_state()'s own
+    // "no request yet" -> ONLINE default).
+    in.last_request_ok = !has_scanned_ || last_backend_ok_;
+    in.last_http_status = last_http_status_;
+    in.consecutive_failures = consecutive_request_failures_;
+    return kiosk::network::classify_network_state(in);
+  }
+
   // --- Phase 2 diagnostics (§44-46, /debug/device-state) ---
   bool has_state_snapshot() const { return state_projection_.has_snapshot(); }
   const kiosk::protocol::StateSnapshot& current_state() const { return state_projection_.current(); }
   bool resyncing() const { return resyncing_; }
+  // Diagnostic-only, same shape as resyncing() -- lets debug-device-state
+  // (and a support call: "màn hình bị đứng?") tell a real hold from a
+  // genuinely stuck device.
+  bool finish_result_hold_active() const { return finish_result_hold_active_; }
   int64_t last_server_seq() const { return last_server_seq_; }
   String local_quantity_buffer() const { return local_qty_buffer_.c_str(); }
 
@@ -183,9 +262,10 @@ class KioskRuntime {
   // -- called once by the .ino on every Wi-Fi reconnect (same trigger point
   // that re-arms bootstrap), NOT a background timer of its own. A no-op if
   // nothing is PENDING/IN_FLIGHT or a replay is already in progress. See
-  // check_offline_replay()'s own comment for why this reuses the SAME
-  // single sender_/apply_event_response() path live scans use, deliberately
-  // NOT a separate AsyncEventSender/completion handler.
+  // check_offline_replay()'s own comment for why this enqueues through the
+  // SAME network_/apply_event_response() path live scans use (as an
+  // OFFLINE_REPLAY-kind request, LOW priority tier), deliberately not a
+  // separate completion handler.
   void start_offline_replay_if_needed();
   // Total PENDING+IN_FLIGHT in the durable journal right now -- the real,
   // persistent backlog size (not just "items left in the current replay
@@ -201,13 +281,6 @@ class KioskRuntime {
   String last_sync_iso() const { return last_sync_iso_.c_str(); }
   String api_endpoint_value() const { return api_endpoint_; }
 
-#if MESFLOW_DEBUG_API
-  // DEV-only fault injection forwarding (§8) -- AsyncEventSender's hook is
-  // private to KioskRuntime (sender_), so expose a narrow pass-through for
-  // the serial test command.
-  void force_next_task_create_failure_for_test() { sender_.force_next_task_create_failure(); }
-#endif
-
  private:
   EventBus& bus_;
   kiosk::ui::Renderer& renderer_;
@@ -216,8 +289,13 @@ class KioskRuntime {
   kiosk::network::TimeSync& time_sync_;
   kiosk::storage::UiBundleStore& ui_bundle_store_;
   kiosk::storage::EventJournal& journal_;
-  kiosk::network::AsyncEventSender sender_;
-  kiosk::network::AsyncStateFetcher state_fetcher_;
+  // Single persistent network worker (2026-08-26 "eliminate recurrent
+  // server connection failures" pass, §2-§5) -- replaces the old
+  // AsyncEventSender/AsyncStateFetcher members, each of which used to spawn
+  // a brand-new FreeRTOS task per call. Owned by the .ino (one instance for
+  // the whole device, shared with HeartbeatClient/BootstrapClient too), so
+  // this is a reference, not a member instance.
+  kiosk::network::NetworkWorker& network_;
   kiosk::protocol::StateProjection state_projection_;
 
   kiosk::protocol::DeviceSequence device_seq_;
@@ -241,6 +319,19 @@ class KioskRuntime {
   bool scan_pending_result_ = false;  // true between the immediate feedback draw and the async result arriving
   String pending_raw_code_;
   uint32_t consecutive_tcp_connect_fail_ = 0;  // see consecutive_tcp_connect_fail()'s own doc comment above
+  uint32_t consecutive_request_failures_ = 0;  // see network_state()'s own doc comment above
+  // ONLINE is the correct initial value: matches classify_network_state()'s
+  // own "no request yet" default, so the very first poll() never logs a
+  // spurious "ONLINE -> ONLINE"-adjacent transition for a boot that hasn't
+  // actually changed anything yet.
+  kiosk::network::NetworkState last_logged_network_state_ = kiosk::network::NetworkState::ONLINE;
+
+  // See take_bootstrap_result()'s own doc comment above.
+  bool bootstrap_result_ready_ = false;
+  kiosk::network::NetworkResult pending_bootstrap_result_;
+  // See take_ui_bundle_fetch_result()'s own doc comment above.
+  bool ui_bundle_fetch_result_ready_ = false;
+  kiosk::network::NetworkResult pending_ui_bundle_fetch_result_;
 
   // --- Scan latency instrumentation (2026-08-26 shared-terminal/latency
   // task) --- millis() checkpoints for a SCAN event only, read back in
@@ -248,10 +339,10 @@ class KioskRuntime {
   // SCAN_LATENCY breakdown (firmware-local time before the network send
   // even started, vs. network round-trip time, vs. render time). 0 means
   // "no scan currently being timed" -- a SCAN's own dispatch always sets
-  // both before sender_.send() is called, so a real 0 can only mean this
-  // boot has never sent one yet.
+  // both before network_.enqueue_business_event() is called, so a real 0
+  // can only mean this boot has never sent one yet.
   unsigned long last_scan_received_ms_ = 0;   // set in handle_scan(), right after the immediate feedback draw
-  unsigned long last_scan_dispatch_ms_ = 0;   // set in send_business_event(), right before sender_.send()
+  unsigned long last_scan_dispatch_ms_ = 0;   // set in send_business_event(), right before network_.enqueue_business_event()
 
   // Phase 2 additions --------------------------------------------------
   bool resyncing_ = false;           // true while a STATE_CONFLICT resync GET /state is outstanding
@@ -264,6 +355,7 @@ class KioskRuntime {
   QtyStep qty_step_ = QtyStep::GOOD;
   int32_t qty_good_ = 0;
   int32_t qty_defect_ = 0;
+  int32_t qty_rework_ = 0;  // only meaningful once QtyStep::SUMMARY is reached -- see that enum value's comment
 
   // --- Self-recovery (2026-08-24) ---
   // §6/§15 of the task: draw_error_view() takes over the whole screen and
@@ -277,20 +369,32 @@ class KioskRuntime {
   unsigned long error_view_shown_at_ms_ = 0;
   static constexpr unsigned long kErrorViewTimeoutMs = 20000;
 
-  // §10: a task-creation failure (API_ERR_TASK_CREATE_FAILED, the real root
-  // cause behind the incident above) gets exactly ONE retry after a bounded
-  // delay -- not an immediate retry (the memory pressure that caused it
-  // needs a moment, plus a chance for the periodic compaction check to
-  // run), and never a silent infinite retry loop. A SECOND consecutive
-  // failure for the SAME event is treated as application-level-exhausted
-  // and escalates to a controlled reboot (§12) rather than leaving the
-  // operator stuck.
-  bool send_retry_pending_ = false;
-  unsigned long send_retry_at_ms_ = 0;
-  std::string retry_json_body_;
-  std::string retry_event_id_;
-  uint64_t retry_device_seq_ = 0;
-  static constexpr unsigned long kSendRetryDelayMs = 800;
+  // Field report (2026-08-27): "khi quet op xong, nên co man hình tổng hợp
+  // là tên gì, làm op gì... 5-10 giay gi do mới chuyen qua man hinh quet
+  // thẻ" -- once a FINISH is actually accepted (see apply_event_response's
+  // QUANTITY_INPUT-exit branch), hold draw_finish_result_screen() for
+  // kFinishResultHoldMs before the normal WAIT_EMPLOYEE card-scan screen
+  // takes over. Same shape as showing_error_view_/error_view_shown_at_ms_
+  // above: a PRESENTATION-only hold, cleared early (not blocked) by any new
+  // business action -- see send_business_event()'s own note on this.
+  bool finish_result_hold_active_ = false;
+  unsigned long finish_result_hold_until_ms_ = 0;
+  String finish_result_employee_name_;
+  String finish_result_operation_code_;
+  int32_t finish_result_good_ = 0;
+  int32_t finish_result_defect_ = 0;
+  int32_t finish_result_rework_ = 0;
+  static constexpr unsigned long kFinishResultHoldMs = 7000;  // "5-10 giay" -> midpoint
+
+  // §10's old "task-creation failure gets one retry then escalates to a
+  // controlled reboot" policy is GONE (2026-08-26 "eliminate recurrent
+  // server connection failures" pass, §7): there is no more per-call task
+  // creation to fail in the first place (NetworkWorker's task is created
+  // exactly once, at boot, by begin()). A queue-full enqueue failure now
+  // just means "not dispatched yet, still safely journaled PENDING" --
+  // see send_business_event()'s own comment -- and is retried by the
+  // ordinary offline-replay path, never by a dedicated retry timer here,
+  // and NEVER by rebooting.
 
   // --- Central UI inactivity timeout (2026-08-26 ESP kiosk UX-hardening
   // pass, §13/ui_timeout_policy.h) ---
@@ -367,7 +471,7 @@ class KioskRuntime {
   bool apply_server_environment(const kiosk::network::BootstrapResult& result);
 
   void check_error_view_timeout();
-  void check_send_retry();
+  void check_finish_result_hold_timeout();
   void check_ui_timeout();
 
   void handle_scan(const String& raw_code, unsigned long timestamp_ms);
@@ -389,7 +493,7 @@ class KioskRuntime {
   void apply_event_response(bool parsed, const kiosk::protocol::EventResponse& resp,
                             const std::string& event_id);
   void start_resync();
-  void handle_resync_result(const kiosk::network::StateFetchOutcome& outcome);
+  void handle_resync_result(const kiosk::network::NetworkResult& result);
   // is_network_error distinguishes a transport/backend-unreachable failure
   // from a business rejection (both set is_error=true) -- Phase 4.1: they
   // must render visually/message-distinct (§3 of the closure task), not

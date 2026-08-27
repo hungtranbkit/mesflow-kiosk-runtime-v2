@@ -13,7 +13,8 @@ std::string build_status_json(kiosk::security::DeviceIdentity& identity,
                               kiosk::hardware::KeypadPcf8574& keypad,
                               const kiosk::hardware::SelfTestResult& selftest,
                               BootDiagnostics& diagnostics,
-                              const kiosk::network::BootstrapClient& bootstrap) {
+                              const kiosk::network::BootstrapClient& bootstrap,
+                              const kiosk::network::WifiManager& wifi) {
   refresh_memory_fields(diagnostics);
 
   bool wifi_connected = WiFi.status() == WL_CONNECTED;
@@ -39,7 +40,17 @@ std::string build_status_json(kiosk::security::DeviceIdentity& identity,
   json += "\"rssi\":" + std::to_string(wifi_connected ? WiFi.RSSI() : 0) + ",";
   json += "\"ip\":\"" + std::string(WiFi.localIP().toString().c_str()) + "\",";
   json += std::string("\"backend_reachable\":") +
-          (runtime.has_scanned() ? (runtime.last_backend_reachable() ? "true" : "false") : "null");
+          (runtime.has_scanned() ? (runtime.last_backend_reachable() ? "true" : "false") : "null") + ",";
+  // §8 of the 2026-08-27 "Final Runtime Closure" pass: the small explicit
+  // ONLINE/DEGRADED/OFFLINE_WIFI/OFFLINE_SERVER/AUTH_BLOCKED classification
+  // -- see network_state.h/kiosk_runtime.h's network_state() for the rule.
+  json += std::string("\"network_state\":\"") + kiosk::network::network_state_to_string(runtime.network_state()) +
+          "\",";
+  // 2026-08-27: reconnect_count was already tracked (WifiManager) but only
+  // reachable via the serial debug-net-diag command -- no way to poll it
+  // remotely for a fleet. Requested explicitly for pilot monitoring
+  // (queue/heap/retry/failed-ACK were already here; this was the one gap).
+  json += "\"reconnect_count\":" + std::to_string(wifi.reconnect_count());
   json += "},";
 
   json += "\"memory\":{";
@@ -113,6 +124,8 @@ std::string build_status_json(kiosk::security::DeviceIdentity& identity,
     json += "\"state_version\":" + std::to_string(snap.state_version) + ",";
     json += "\"workflow_version\":" + std::to_string(snap.workflow_version) + ",";
     json += "\"resyncing\":" + std::string(runtime.resyncing() ? "true" : "false") + ",";
+    json += "\"finish_result_hold_active\":" +
+            std::string(runtime.finish_result_hold_active() ? "true" : "false") + ",";
     json += "\"last_server_seq\":" + std::to_string(runtime.last_server_seq()) + ",";
     json += "\"source\":\"" + std::string(runtime.resyncing() ? "RESYNC_PENDING" : "SERVER") + "\",";
     // Sanitized view: only the same operational fields already shown on
@@ -223,6 +236,13 @@ std::string build_status_json(kiosk::security::DeviceIdentity& identity,
   // follows.
   {
     json += "\"recovery\":{";
+    // Real field report (2026-08-27): a device that rebooted (or was
+    // power-cycled) had NO way to answer "why" after the fact -- the reset
+    // reason only ever appeared in the one-time BOOT serial log line at the
+    // exact moment of boot, gone forever if nobody was watching right then.
+    // Exposed here so debug-device-state can answer that question on ANY
+    // later poll this same boot, not just the first few seconds of it.
+    json += "\"reset_reason\":\"" + kiosk::protocol::json_escape(diagnostics.reset_reason.c_str()) + "\",";
     json += std::string("\"safe_mode\":") + (kiosk::health::is_safe_mode() ? "true" : "false") + ",";
     json += "\"same_fault_streak\":" + std::to_string(kiosk::health::same_fault_streak()) + ",";
     json += "\"history\":[";

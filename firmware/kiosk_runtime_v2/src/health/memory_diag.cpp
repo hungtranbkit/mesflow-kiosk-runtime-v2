@@ -25,12 +25,20 @@ MemorySnapshot capture_memory_snapshot() {
 
 void log_memory_snapshot(const char* stage) {
   MemorySnapshot s = capture_memory_snapshot();
-  char msg[192];
+  // task_count added 2026-08-26 ("eliminate recurrent server connection
+  // failures" pass, §8/§19): the whole point of NetworkWorker replacing
+  // per-call xTaskCreate() is that this number now stays CONSTANT for the
+  // life of the boot instead of climbing/sawtoothing with every scan/
+  // heartbeat -- this is the cheapest possible way to make that claim
+  // checkable from the serial log instead of just asserted.
+  UBaseType_t task_count = uxTaskGetNumberOfTasks();
+  char msg[224];
   snprintf(msg, sizeof(msg),
            "stage=%s task=%s uptime_ms=%lu int_free=%u int_largest=%u int_min=%u "
-           "psram_free=%u psram_largest=%u total_free=%u total_largest=%u",
+           "psram_free=%u psram_largest=%u total_free=%u total_largest=%u task_count=%u",
            stage, pcTaskGetName(nullptr), millis(), s.internal_free, s.internal_largest,
-           s.internal_min_ever, s.psram_free, s.psram_largest, s.total_free, s.total_largest);
+           s.internal_min_ever, s.psram_free, s.psram_largest, s.total_free, s.total_largest,
+           static_cast<unsigned>(task_count));
   log_structured("INFO", "MEMORY_SNAPSHOT", "memory_diag", msg);
 }
 

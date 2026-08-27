@@ -2,23 +2,31 @@
 
 #include <Arduino.h>
 
-#include "../network/state_client.h"
 #include "../storage/ui_bundle_store.h"
+#include "kiosk_runtime.h"
 
 namespace kiosk::runtime {
 
 // Owns the (rare, background) UI bundle download/verify/activate flow,
-// separate from KioskRuntime's own RESYNC fetcher so a UI check never
-// competes with a business-state resync for the single-in-flight slot.
+// separate from KioskRuntime's own RESYNC fetch so a UI check never
+// competes with a business-state resync for priority (see
+// NetworkRequestKind::UI_BUNDLE_FETCH's own comment: same worker, LOW tier,
+// distinct kind).
 //
-// §24: UI updates must never freeze kiosk interaction -- the download runs
-// on AsyncStateFetcher's own background FreeRTOS task (same "never block
-// display/keypad/scanner" shape as every other network call in this
-// codebase); poll() (called every loop()) picks up the completed result
-// non-blockingly and does the (fast, local) verify+stage+activate work.
+// §24: UI updates must never freeze kiosk interaction. 2026-08-27 "close
+// final two runtime gaps" pass: this used to run on AsyncStateFetcher's own
+// per-call background FreeRTOS task (state_client.cpp) -- the LAST
+// remaining per-call xTaskCreate in the whole network stack. Migrated onto
+// the shared, persistent NetworkWorker via KioskRuntime's
+// enqueue_ui_bundle_fetch()/take_ui_bundle_fetch_result() (same
+// stash-and-collect shape BootstrapClient's own migration already
+// established) -- poll() (called every loop()) still picks up the
+// completed result non-blockingly and does the (fast, local)
+// verify+stage+activate work, unchanged.
 class UiSyncController {
  public:
-  explicit UiSyncController(kiosk::storage::UiBundleStore& store) : store_(store) {}
+  UiSyncController(kiosk::storage::UiBundleStore& store, KioskRuntime& runtime)
+      : store_(store), runtime_(runtime) {}
 
   // Compares what the server just reported (from a bootstrap/heartbeat
   // response's desired.ui_bundle_version/hash) against what's currently
@@ -44,7 +52,12 @@ class UiSyncController {
 
  private:
   kiosk::storage::UiBundleStore& store_;
-  kiosk::network::AsyncStateFetcher fetcher_;
+  KioskRuntime& runtime_;
+  // Tracked locally now (NetworkWorker has no per-kind busy() query) --
+  // set true on a successful enqueue, cleared the moment poll() actually
+  // collects that fetch's result (success OR failure), same lifetime the
+  // old fetcher_.busy() had.
+  bool download_in_flight_ = false;
   uint32_t pending_version_ = 0;
   uint32_t last_desired_version_ = 0;
 };

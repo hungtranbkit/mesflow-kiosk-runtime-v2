@@ -1,16 +1,11 @@
 #include "bootstrap_client.h"
 
-#include <HTTPClient.h>
-#include <WiFi.h>
-
 #include "../config/build_info.h"
 #include "../config/hardware_pins.h"
 #include "../config/runtime_config.h"
 #include "../health/structured_log.h"
 #include "../protocol/json_extract.h"    // whitespace-tolerant field extraction
 #include "../protocol/protocol_codec.h"  // json_escape
-#include "../protocol/retry_policy.h"    // kResponseTooLargeMarker
-#include "endpoint_utils.h"
 
 namespace kiosk::network {
 
@@ -24,37 +19,8 @@ const char* bootstrap_status_to_string(BootstrapStatus status) {
   return "UNKNOWN";
 }
 
-BootstrapResult BootstrapClient::attempt(const String& events_url, const String& device_id,
-                                         const String& hardware_id, const String& boot_id,
-                                         uint32_t last_device_seq) {
-  BootstrapResult result;
-
-  if (WiFi.status() != WL_CONNECTED || events_url.length() == 0) {
-    result.status = BootstrapStatus::FAILED;
-    last_result_ = result;
-    kiosk::health::log_structured("WARN", "BOOTSTRAP_REJECTED", "bootstrap_client",
-                                   "no wifi or no backend configured");
-    return result;
-  }
-
-  // A REAL bug caught live (Phase 2): this used to POST directly to
-  // `events_url` (the stored /events endpoint) instead of deriving the
-  // /bootstrap sibling endpoint. Every bootstrap request silently landed on
-  // the mock backend's /events handler, which correctly rejected it (a
-  // bootstrap body has no top-level protocol_version field) and replied
-  // with a real HTTP 200 body containing "accepted": false -- indistinguish-
-  // able, from this client's point of view, from a genuine bootstrap
-  // rejection. heartbeat_client.cpp already derived its own sibling
-  // endpoint correctly; bootstrap_client just never did the same swap.
-  String url = derive_sibling_endpoint(events_url, "bootstrap");
-  if (url.length() == 0) {
-    result.status = BootstrapStatus::FAILED;
-    last_result_ = result;
-    kiosk::health::log_structured("ERROR", "BOOTSTRAP_REJECTED", "bootstrap_client",
-                                   "could not derive /bootstrap endpoint from configured URL");
-    return result;
-  }
-
+std::string BootstrapClient::build_request_body(const String& device_id, const String& hardware_id,
+                                                 const String& boot_id, uint32_t last_device_seq) {
   std::string body = "{";
   body += "\"device_id\":\"" + kiosk::protocol::json_escape(device_id.c_str()) + "\",";
   body += "\"hardware_id\":\"" + kiosk::protocol::json_escape(hardware_id.c_str()) + "\",";
@@ -65,39 +31,18 @@ BootstrapResult BootstrapClient::attempt(const String& events_url, const String&
   body += "\"current\":{\"ui_bundle\":0,\"workflow\":0,\"state_version\":0,\"last_device_seq\":";
   body += std::to_string(last_device_seq);
   body += "}}";
+  return body;
+}
 
-  HTTPClient http;
-  http.setTimeout(RUNTIME_HTTP_TIMEOUT_MS);
-  http.setConnectTimeout(RUNTIME_HTTP_TIMEOUT_MS);
-  if (!http.begin(url)) {
-    result.status = BootstrapStatus::FAILED;
-    last_result_ = result;
-    kiosk::health::log_structured("ERROR", "BOOTSTRAP_REJECTED", "bootstrap_client",
-                                   "HTTPClient::begin failed");
-    return result;
-  }
-  http.addHeader("Content-Type", "application/json");
+BootstrapResult BootstrapClient::parse_response(int http_status, const std::string& response_body) {
+  BootstrapResult result;
 
-  int status = http.POST(body.c_str());
-  // Response-size guard (2026-08-26): see RUNTIME_MAX_RESPONSE_BODY_BYTES'
-  // own doc comment -- reject on Content-Length alone, before ever calling
-  // getString(), rather than let a pathological response allocate an
-  // unbounded String.
-  std::string response;
-  if (status > 0) {
-    int content_length = http.getSize();
-    if (content_length < 0 || content_length > RUNTIME_MAX_RESPONSE_BODY_BYTES) {
-      kiosk::health::log_structured(
-          "ERROR", "BOOTSTRAP_RESPONSE_TOO_LARGE", "bootstrap_client",
-          (std::string("content_length=") + std::to_string(content_length)).c_str());
-      status = kiosk::protocol::kResponseTooLargeMarker;
-    } else {
-      response = std::string(http.getString().c_str());
-    }
-  }
-  http.end();
-
-  if (status <= 0) {
+  // Mirrors the old blocking attempt()'s own "no response from backend"
+  // path exactly: http_status<=0 covers a transport-level failure (no
+  // response at all) the SAME way it always did, whether that came from a
+  // direct HTTPClient POST returning a negative/zero status or from
+  // NetworkWorker's own classify_http_result()-derived http_status here.
+  if (http_status <= 0) {
     result.status = BootstrapStatus::FAILED;
     kiosk::health::log_structured("WARN", "BOOTSTRAP_REJECTED", "bootstrap_client",
                                    "no response from backend");
@@ -113,8 +58,8 @@ BootstrapResult BootstrapClient::attempt(const String& events_url, const String&
   // json_extract_* (already used by state_projection/event_response,
   // host-tested) skips whitespace correctly; reusing it here instead of
   // maintaining a second, buggier parser.
-  bool accepted = kiosk::protocol::json_extract_bool(response, "accepted", false);
-  std::string protocol_obj = kiosk::protocol::json_extract_object(response, "protocol");
+  bool accepted = kiosk::protocol::json_extract_bool(response_body, "accepted", false);
+  std::string protocol_obj = kiosk::protocol::json_extract_object(response_body, "protocol");
   int64_t accepted_version =
       protocol_obj.empty() ? 0 : kiosk::protocol::json_extract_int(protocol_obj, "accepted_version", 0);
 
@@ -128,7 +73,7 @@ BootstrapResult BootstrapClient::attempt(const String& events_url, const String&
     // business-rejection shape is. "" if absent (an older backend, or the
     // OTHER rejection cause with no message field -- unsupported
     // protocol_version).
-    result.reject_message = kiosk::protocol::json_extract_string(response, "message").c_str();
+    result.reject_message = kiosk::protocol::json_extract_string(response_body, "message").c_str();
     kiosk::health::log_structured("WARN", "BOOTSTRAP_REJECTED", "bootstrap_client",
                                    accepted ? "unsupported protocol_version" : "accepted:false");
     last_result_ = result;
@@ -138,19 +83,19 @@ BootstrapResult BootstrapClient::attempt(const String& events_url, const String&
   result.status = BootstrapStatus::OK;
   result.last_ok_uptime_ms = millis();
   result.accepted_protocol_version = accepted_version != 0 ? static_cast<uint32_t>(accepted_version) : 1;
-  result.device_status = kiosk::protocol::json_extract_string(response, "device_status").c_str();
-  std::string state_obj = kiosk::protocol::json_extract_object(response, "state");
+  result.device_status = kiosk::protocol::json_extract_string(response_body, "device_status").c_str();
+  std::string state_obj = kiosk::protocol::json_extract_object(response_body, "state");
   result.state_name = state_obj.empty() ? "" : kiosk::protocol::json_extract_string(state_obj, "name").c_str();
 
   // Same state{}/workflow{}/view{} shape as /events and /state -- seed
   // StateProjection's very first snapshot from THIS response so the device
   // never has to invent a starting business state locally (invariant 15).
-  result.has_snapshot = kiosk::protocol::parse_state_snapshot_json(response, result.snapshot);
+  result.has_snapshot = kiosk::protocol::parse_state_snapshot_json(response_body, result.snapshot);
 
   // Phase 4: desired.ui_bundle_version/hash -- read once at boot (heartbeat
   // could also carry this for faster propagation between reboots; not
   // implemented yet, see the Phase 4 report's Known Gaps).
-  std::string desired_obj = kiosk::protocol::json_extract_object(response, "desired");
+  std::string desired_obj = kiosk::protocol::json_extract_object(response_body, "desired");
   if (!desired_obj.empty()) {
     result.ui_bundle_version =
         static_cast<uint32_t>(kiosk::protocol::json_extract_int(desired_obj, "ui_bundle_version", 0));
@@ -162,9 +107,9 @@ BootstrapResult BootstrapClient::attempt(const String& events_url, const String&
   // handles a JSON null (settings.server_role can be None) the same as a
   // missing key, both come back "" here, which is exactly the honest
   // "server didn't say" value environment_label.h maps to UNKNOWN.
-  result.server_environment = kiosk::protocol::json_extract_string(response, "environment").c_str();
-  result.server_role = kiosk::protocol::json_extract_string(response, "server_role").c_str();
-  result.server_version = kiosk::protocol::json_extract_string(response, "version").c_str();
+  result.server_environment = kiosk::protocol::json_extract_string(response_body, "environment").c_str();
+  result.server_role = kiosk::protocol::json_extract_string(response_body, "server_role").c_str();
+  result.server_version = kiosk::protocol::json_extract_string(response_body, "version").c_str();
 
   kiosk::health::log_structured("INFO", "BOOTSTRAP_OK", "bootstrap_client",
                                  result.device_status.c_str());

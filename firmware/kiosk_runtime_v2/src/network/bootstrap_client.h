@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 
+#include <string>
+
 #include "../protocol/state_projection.h"
 
 namespace kiosk::network {
@@ -60,14 +62,37 @@ struct BootstrapResult {
   String reject_message;
 };
 
-// Single attempt, blocking (this runs once at boot, before normal scan
-// handling -- not on the hot path §23 cares about). Builds the bootstrap
-// request from the given identity/diagnostics/config inputs and POSTs it.
+// Real field report (2026-08-27, "máy quét phải luôn sẵn sàng" -- the kiosk
+// must always be ready, intermittent unresponsiveness is unacceptable):
+// this used to be "single attempt, blocking" -- a plain synchronous
+// HTTPClient POST run directly on the main loop() thread, one of only two
+// blocking calls left after the NetworkWorker migration (the other being
+// per-call task creation, already fixed). Bootstrap re-fires on every WiFi
+// reconnect (kiosk_runtime_v2.ino's own re-verification logic) -- including
+// the pre-existing consecutive_tcp_connect_fail_ -> force_reconnect() self-
+// heal path -- so a single degraded-network episode could block the
+// keypad/scanner from being polled at all for multiple seconds per retry
+// attempt. Split into two PURE, no-I/O halves so the .ino can drive the
+// actual HTTP request through NetworkWorker (like every other request kind)
+// instead of blocking here:
+//   build_request_body() -- builds the JSON body, no network at all.
+//   parse_response()     -- turns a completed NetworkWorker BOOTSTRAP
+//                           result's (http_status, response_body) into a
+//                           BootstrapResult, no network at all.
+// Neither half touches WiFi/HTTPClient directly -- the .ino owns enqueueing
+// via NetworkWorker::enqueue_bootstrap() and the retry/cooldown bookkeeping
+// (unchanged in shape, just no longer blocking while it waits).
 class BootstrapClient {
  public:
-  // Returns the result (also cached, see last_result()).
-  BootstrapResult attempt(const String& url, const String& device_id, const String& hardware_id,
-                          const String& boot_id, uint32_t last_device_seq);
+  static std::string build_request_body(const String& device_id, const String& hardware_id,
+                                        const String& boot_id, uint32_t last_device_seq);
+
+  // Returns the result (also cached, see last_result()). http_status is
+  // NetworkResult::outcome.http_status from the completed BOOTSTRAP request
+  // -- 0 (or negative, e.g. kResponseTooLargeMarker) means no usable
+  // response was ever received, mapped the same way a direct HTTPClient
+  // failure always was.
+  BootstrapResult parse_response(int http_status, const std::string& response_body);
 
   const BootstrapResult& last_result() const { return last_result_; }
 

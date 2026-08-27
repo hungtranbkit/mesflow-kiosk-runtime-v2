@@ -11,6 +11,7 @@
 #include "../hardware/keypad_pcf8574.h"
 #include "../network/bootstrap_client.h"
 #include "../network/time_sync.h"
+#include "../network/wifi_manager.h"
 #include "../runtime/boot_diagnostics.h"
 #include "../runtime/event_bus.h"
 #include "../runtime/kiosk_runtime.h"
@@ -99,7 +100,8 @@ class DebugServer {
               kiosk::security::DeviceIdentity& identity, kiosk::network::TimeSync& time_sync,
               const kiosk::network::BootstrapClient& bootstrap,
               const kiosk::storage::UiBundleStore& ui_bundle_store,
-              const kiosk::runtime::UiSyncController& ui_sync)
+              const kiosk::runtime::UiSyncController& ui_sync,
+              const kiosk::network::WifiManager& wifi)
       : bus_(bus),
         display_(display),
         renderer_(renderer),
@@ -111,7 +113,8 @@ class DebugServer {
         time_sync_(time_sync),
         bootstrap_(bootstrap),
         ui_bundle_store_(ui_bundle_store),
-        ui_sync_(ui_sync) {}
+        ui_sync_(ui_sync),
+        wifi_(wifi) {}
 
   void begin();
   void poll();  // call every loop() iteration
@@ -188,6 +191,7 @@ class DebugServer {
   const kiosk::network::BootstrapClient& bootstrap_;
   const kiosk::storage::UiBundleStore& ui_bundle_store_;
   const kiosk::runtime::UiSyncController& ui_sync_;
+  const kiosk::network::WifiManager& wifi_;
 
   WebServer web_{MESFLOW_DEBUG_API_PORT};
   unsigned long last_screenshot_ms_ = 0;
