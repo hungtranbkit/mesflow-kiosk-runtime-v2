@@ -59,6 +59,27 @@ class DeviceIdentity {
   // backend admin action to trigger them.
   void set_state(ProvisioningState state);
 
+  // Kiosk v2 P0 auth fix (2026-08-28, backend companion:
+  // mesflow's app/mesflow/web/kiosk_v2.py _authorize_kiosk_v2_device()):
+  // the server-issued credential this device presents as X-Kiosk-Token on
+  // every /events POST and /state GET from now on. "" means never
+  // provisioned -- those two calls will then get a real 401 from the
+  // server rather than silently succeeding, which is the whole point of
+  // that backend fix. Deliberately NOT sent on /bootstrap or /heartbeat
+  // (see the backend's own comment on why -- bootstrap has no auth of its
+  // own by design, so handing the token back there would let anyone who
+  // knows this device's public device_id harvest it).
+  //
+  // Provisioning is out-of-band, same shape as this file's own
+  // provision()/the .ino's existing wifi:/api-endpoint:/expected-env:
+  // serial commands: an admin approves the device via MESFlow's
+  // /api/kiosk-identities/<id>/approve (or /api/kiosk/bind), reads the
+  // plaintext token off THAT response, and types it into the device once
+  // via the new `kiosk-token:<token>` serial command -- never learned by
+  // the device over the wire.
+  String kiosk_token();
+  bool set_kiosk_token(const String& token);
+
  private:
   bool initialized_ = false;
 };

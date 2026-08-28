@@ -410,7 +410,8 @@ void KioskRuntime::check_offline_replay() {
   // network_worker.h's own top comment for why the worker thread must never
   // touch EventJournal directly) and copied into the request's fixed body[]
   // buffer by enqueue_offline_replay() itself.
-  bool queued = network_.enqueue_offline_replay(record->event_id, record->device_seq, api_endpoint_, record->payload);
+  bool queued = network_.enqueue_offline_replay(record->event_id, record->device_seq, api_endpoint_, record->payload,
+                                                identity_.kiosk_token());
   if (queued) {
     replaying_ = true;
     kiosk::health::log_structured(
@@ -438,7 +439,7 @@ void KioskRuntime::start_resync() {
   resyncing_ = true;
   renderer_.draw_resyncing_screen(wifi_indicator_);
   String url = state_endpoint_url();
-  bool queued = network_.enqueue_state_fetch(url);
+  bool queued = network_.enqueue_state_fetch(url, identity_.kiosk_token());
   if (!queued) {
     // HIGH-tier queue momentarily full (a business event or bootstrap is
     // ahead of it) -- fine, resyncing_ stays true and the next poll() cycle
@@ -931,7 +932,7 @@ void KioskRuntime::send_business_event(kiosk::protocol::EventType type, const St
   // millis() read) -- only ever read back for a SCAN in poll(), see there.
   last_scan_dispatch_ms_ = millis();
   bool queued = network_.enqueue_business_event(event.event.event_id, event.event.device_seq, api_endpoint_,
-                                                json_body);
+                                                json_body, identity_.kiosk_token());
   if (queued) {
     // PENDING -> IN_FLIGHT now that the worker has actually accepted this
     // request onto its HIGH-priority queue.
