@@ -82,4 +82,23 @@ void DeviceIdentity::set_state(ProvisioningState new_state) {
                                  provisioning_state_to_string(new_state));
 }
 
+String DeviceIdentity::kiosk_token() {
+  prefs.begin(kNamespace, true);
+  String token = prefs.getString("kiosk_token", "");
+  prefs.end();
+  return token;
+}
+
+bool DeviceIdentity::set_kiosk_token(const String& token) {
+  prefs.begin(kNamespace, false);
+  bool ok = prefs.putString("kiosk_token", token) > 0 || token.length() == 0;
+  prefs.end();
+  // Never logs the token value itself -- same posture as wifi_password()'s
+  // own handling elsewhere in this codebase (a credential, not diagnostic
+  // data safe to put in structured logs).
+  kiosk::health::log_structured("INFO", "IDENTITY_KIOSK_TOKEN_SET", "device_identity",
+                                 token.length() > 0 ? "token stored" : "token cleared");
+  return ok;
+}
+
 }  // namespace kiosk::security

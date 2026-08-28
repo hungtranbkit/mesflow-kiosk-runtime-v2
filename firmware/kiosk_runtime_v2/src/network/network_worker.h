@@ -98,6 +98,11 @@ constexpr size_t kMaxQueuedUrlBytes = 160;
 // total static cost stays bounded and small in absolute terms.
 constexpr size_t kMaxQueuedBodyBytes = 2560;
 constexpr size_t kMaxQueuedEventIdBytes = 40;  // event_ids are 32 hex chars + margin
+// secrets.token_urlsafe(32) (the backend's actual generator, see
+// KioskRepository.approve()/bind_legacy() in mesflow's execution.py) yields
+// ~43 base64url characters -- 64 leaves real margin without being an
+// unbounded guess, matching this struct's own "bounded, fixed" convention.
+constexpr size_t kMaxQueuedTokenBytes = 64;
 
 // Fixed-size, POD (no String/std::string members) -- safe to memcpy into a
 // FreeRTOS queue slot. §4: "do not put full JSON payloads or large Strings
@@ -111,6 +116,13 @@ struct NetworkRequest {
   uint64_t device_seq = 0;                      // BUSINESS_EVENT/OFFLINE_REPLAY only
   char body[kMaxQueuedBodyBytes] = {0};         // POST body for all kinds except STATE_FETCH (a GET)
   uint16_t body_len = 0;
+  // BUSINESS_EVENT/OFFLINE_REPLAY/STATE_FETCH only (2026-08-28 P0 auth fix)
+  // -- sent as X-Kiosk-Token. Copied in on the calling thread, same
+  // thread-safety reasoning as `body`/`url` above (this struct's own top
+  // comment). Empty for BOOTSTRAP/HEARTBEAT/UI_BUNDLE_FETCH, which never
+  // attach this header -- see DeviceIdentity::kiosk_token()'s own comment
+  // for why.
+  char kiosk_token[kMaxQueuedTokenBytes] = {0};
 };
 
 // Result of ONE completed request. This is NOT queued (only one request is
@@ -153,11 +165,16 @@ class NetworkWorker {
   // into the request's fixed buffer here, on the CALLING thread -- see
   // this header's own top comment for why (thread safety, not a style
   // choice).
+  // `kiosk_token` (2026-08-28 P0 auth fix): default "" preserves source
+  // compatibility for any caller that predates this change, but in
+  // practice every real caller now passes DeviceIdentity::kiosk_token() --
+  // an empty token here just means the server will correctly 401 the
+  // request, not a silent bypass.
   bool enqueue_business_event(const std::string& event_id, uint64_t device_seq, const String& url,
-                              const std::string& payload);
+                              const std::string& payload, const String& kiosk_token = "");
   bool enqueue_offline_replay(const std::string& event_id, uint64_t device_seq, const String& url,
-                             const std::string& payload);
-  bool enqueue_state_fetch(const String& url);
+                             const std::string& payload, const String& kiosk_token = "");
+  bool enqueue_state_fetch(const String& url, const String& kiosk_token = "");
   // LOW tier -- see NetworkRequestKind::UI_BUNDLE_FETCH's own comment for why
   // this is a distinct kind/priority from enqueue_state_fetch() above.
   bool enqueue_ui_bundle_fetch(const String& url);

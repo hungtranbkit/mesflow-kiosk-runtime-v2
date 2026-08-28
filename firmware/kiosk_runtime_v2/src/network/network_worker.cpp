@@ -38,7 +38,7 @@ String extract_host(const char* url) {
 // Returns the raw status (or a negative marker) and fills out_body on a
 // real 2xx-or-not response actually received.
 int perform_http_attempt(const char* url, const char* body, std::string* out_body,
-                         String* out_retry_after) {
+                         String* out_retry_after, const char* kiosk_token = nullptr) {
   IPAddress resolved;
   if (!WiFi.hostByName(extract_host(url).c_str(), resolved)) {
     kiosk::health::log_structured("WARN", "API_ERR_DNS_FAIL", "network_worker",
@@ -55,6 +55,13 @@ int perform_http_attempt(const char* url, const char* body, std::string* out_bod
     return -1;  // treated as TCP_CONNECT_FAIL by classify_http_result
   }
 
+  // 2026-08-28 P0 auth fix companion: attached only for BUSINESS_EVENT/
+  // OFFLINE_REPLAY/STATE_FETCH (the only kinds that ever populate
+  // req.kiosk_token, see NetworkRequest's own comment) -- never for
+  // BOOTSTRAP/HEARTBEAT/UI_BUNDLE_FETCH, which don't require or send one.
+  if (kiosk_token != nullptr && kiosk_token[0] != '\0') {
+    http.addHeader("X-Kiosk-Token", kiosk_token);
+  }
   int status;
   if (body != nullptr) {
     http.addHeader("Content-Type", "application/json");
@@ -121,31 +128,34 @@ void fill_body(NetworkRequest& req, const std::string& body) {
 }  // namespace
 
 bool NetworkWorker::enqueue_business_event(const std::string& event_id, uint64_t device_seq, const String& url,
-                                           const std::string& payload) {
+                                           const std::string& payload, const String& kiosk_token) {
   NetworkRequest req;
   req.kind = NetworkRequestKind::BUSINESS_EVENT;
   strncpy(req.url, url.c_str(), kMaxQueuedUrlBytes - 1);
   strncpy(req.event_id, event_id.c_str(), kMaxQueuedEventIdBytes - 1);
   req.device_seq = device_seq;
   fill_body(req, payload);
+  strncpy(req.kiosk_token, kiosk_token.c_str(), kMaxQueuedTokenBytes - 1);
   return enqueue(NetworkPriorityTier::PRIORITY_HIGH, req);
 }
 
 bool NetworkWorker::enqueue_offline_replay(const std::string& event_id, uint64_t device_seq, const String& url,
-                                           const std::string& payload) {
+                                           const std::string& payload, const String& kiosk_token) {
   NetworkRequest req;
   req.kind = NetworkRequestKind::OFFLINE_REPLAY;
   strncpy(req.url, url.c_str(), kMaxQueuedUrlBytes - 1);
   strncpy(req.event_id, event_id.c_str(), kMaxQueuedEventIdBytes - 1);
   req.device_seq = device_seq;
   fill_body(req, payload);
+  strncpy(req.kiosk_token, kiosk_token.c_str(), kMaxQueuedTokenBytes - 1);
   return enqueue(NetworkPriorityTier::PRIORITY_LOW, req);
 }
 
-bool NetworkWorker::enqueue_state_fetch(const String& url) {
+bool NetworkWorker::enqueue_state_fetch(const String& url, const String& kiosk_token) {
   NetworkRequest req;
   req.kind = NetworkRequestKind::STATE_FETCH;
   strncpy(req.url, url.c_str(), kMaxQueuedUrlBytes - 1);
+  strncpy(req.kiosk_token, kiosk_token.c_str(), kMaxQueuedTokenBytes - 1);
   return enqueue(NetworkPriorityTier::PRIORITY_HIGH, req);
 }
 
@@ -254,7 +264,7 @@ NetworkResult NetworkWorker::execute(const NetworkRequest& req) {
     std::string last_body;
     for (;;) {
       String retry_after_header;
-      int status = perform_http_attempt(req.url, payload.c_str(), &last_body, &retry_after_header);
+      int status = perform_http_attempt(req.url, payload.c_str(), &last_body, &retry_after_header, req.kiosk_token);
       kiosk::protocol::RetryAfterResult retry_after =
           kiosk::protocol::parse_retry_after(std::string(retry_after_header.c_str()));
       outcome = kiosk::protocol::classify_http_result(
@@ -293,7 +303,10 @@ NetworkResult NetworkWorker::execute(const NetworkRequest& req) {
   bool is_get = req.kind == NetworkRequestKind::STATE_FETCH || req.kind == NetworkRequestKind::UI_BUNDLE_FETCH;
   const char* body_ptr = is_get ? nullptr : body_str.c_str();
   std::string response_body;
-  int status = perform_http_attempt(req.url, body_ptr, &response_body, nullptr);
+  // STATE_FETCH also carries a token (req.kiosk_token is only ever
+  // populated for it, BOOTSTRAP/HEARTBEAT/UI_BUNDLE_FETCH always leave it
+  // empty) -- perform_http_attempt() itself no-ops the header when empty.
+  int status = perform_http_attempt(req.url, body_ptr, &response_body, nullptr, req.kiosk_token);
   result.outcome = kiosk::protocol::classify_http_result(status);
   result.attempts = 1;
   result.response_body = response_body;

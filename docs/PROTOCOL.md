@@ -220,6 +220,58 @@ event responses past the device's hard deadline, to simulate a lost ACK —
 see docs/RETRY_POLICY.md; none of `/mock/*`/`/_test/*` are part of the real
 protocol).
 
+### Device authorization — `X-Kiosk-Token` (added 2026-08-28, P0 fix)
+
+`POST /events` and `GET /state` now require a real, ACTIVE `kiosk_identities`
+row for the claimed `device_id`, PLUS an `X-Kiosk-Token` header whose value
+hashes to that row's `token_hash` (see mesflow's
+`app/mesflow/web/kiosk_v2.py::_authorize_kiosk_v2_device`). Before this fix
+neither endpoint checked device identity at all — a real P0: any caller
+that knew a device_id (a public, non-secret string sent on every request)
+could drive real START/FINISH/quantity business mutations, and an
+admin-DISABLED device kept working forever.
+
+Responses on failure: `403 {"error":{"code":"DEVICE_NOT_ALLOWED"}}` for an
+unknown/PENDING/SUSPENDED/DISABLED device or a wrong/mismatched token;
+`401 {"error":{"code":"AUTH_REQUIRED"}}` for an ACTIVE device presenting no
+token at all. `retry_policy.cpp::classify_http_result()` already classified
+any 4xx (including 401/403) as `HTTP_4XX`/non-retryable *before* this fix
+landed (its own comment: "Phase 1 doesn't yet have a real auth handshake to
+react to them differently; that's a later integration point, not invented
+here") — this IS that integration point; no retry-taxonomy change was
+needed, a device just correctly stops retrying and surfaces the failure.
+
+**Deliberately NOT required on** `/bootstrap` or `/heartbeat` — those stay
+on the existing identity+status-only check (no token), since a brand-new
+or not-yet-provisioned device must still be able to reach them to discover
+config and learn its own real status; requiring a token there would break
+onboarding, and neither call can be tricked into a business *effect* the
+way `/events` can. **Also not required on** `GET /ui-bundles/<version>` —
+pure static render-instruction content, no business/PII data, deliberately
+public (see that route's own comment).
+
+**Provisioning the token onto a device**: the plaintext only ever exists in
+the response of MESFlow's `POST /api/kiosk-identities/<id>/approve`
+(admin-session-authenticated) or `POST /api/kiosk/bind` (requires proof of
+the CURRENT token to rotate an already-ACTIVE identity, or
+`MESFLOW_ALLOW_LEGACY_KIOSK_AUTOBIND` for a brand-new one) — both pre-exist
+this fix and are already secure. `bootstrap()` deliberately never hands the
+token back on any call (it has no auth of its own, so doing so would let
+anyone who merely knows the device_id harvest it and defeat this whole
+check). Getting it onto the physical device is therefore an out-of-band
+step, the same shape as the existing `wifi:`/`api-endpoint:`/
+`expected-env:` serial commands: type `kiosk-token:<token>` at the serial
+console (`DeviceIdentity::set_kiosk_token`, NVS-persisted, no reboot
+needed — `KioskRuntime` reads it fresh on every send/state-fetch).
+
+**Compatibility note**: a device that was auto-bound (or otherwise reached
+ACTIVE) before this fix has a real `token_hash` in `kiosk_identities`
+already (set at bind time) but was never HANDED that plaintext, since
+kiosk_v2's bootstrap always discarded it. Such a device will get a clean
+401 on every `/events`/`/state` call — by design, not a bug — until an
+admin re-approves/rebinds it and the resulting token is provisioned via
+`kiosk-token:` above.
+
 ### GET /api/kiosk/v2/state?device_id=... (Phase 2, `network/state_client.*`)
 
 Returns the SAME `state{}`/`workflow{}`/`view{}` shape as a bootstrap/events

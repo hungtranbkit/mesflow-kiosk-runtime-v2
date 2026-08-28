@@ -509,6 +509,13 @@ namespace {
 //   provision:<device_id>     assign device_id, move provisioning_state to
 //                             ACTIVE, then reboot (§4/§5/§36 -- DEV-path
 //                             provisioning skeleton; see docs/PROVISIONING.md)
+//   kiosk-token:<token>        2026-08-28 P0 auth fix: set the credential
+//                             sent as X-Kiosk-Token on /events and /state.
+//                             Get the plaintext from MESFlow's
+//                             POST /api/kiosk-identities/<id>/approve (or
+//                             /api/kiosk/bind) response -- an admin-
+//                             authenticated call, never learned by the
+//                             device itself over the wire. No reboot.
 //   suspend / revoke          DEV-only: force provisioning_state for testing
 //                             §5's behavior without a real backend admin
 //                             action (KIOSK-079/080)
@@ -614,6 +621,20 @@ void poll_serial_provisioning() {
         } else {
           Serial.println("Usage: provision:<device_id>");
         }
+      } else if (line.startsWith("kiosk-token:")) {
+        // 2026-08-28 kiosk v2 P0 auth fix: the credential this device
+        // presents as X-Kiosk-Token on /events and /state from now on. No
+        // reboot needed (KioskRuntime reads DeviceIdentity::kiosk_token()
+        // fresh on every send/state-fetch, not cached at boot) -- unlike
+        // wifi:/api-endpoint:/expected-env:, which change what/where to
+        // connect and so do need one. Never echoes the token back over
+        // Serial (a credential, not diagnostic data).
+        String token = line.substring(12);
+        token.trim();
+        bool ok = g_identity.set_kiosk_token(token);
+        Serial.printf("{\"level\":\"INFO\",\"code\":\"CONFIG_KIOSK_TOKEN_SET\","
+                      "\"module\":\"provisioning\",\"ok\":%s}\n",
+                      ok ? "true" : "false");
       } else if (line == "suspend") {
         g_identity.set_state(kiosk::security::ProvisioningState::SUSPENDED);
         g_runtime.refresh_idle_screen();
