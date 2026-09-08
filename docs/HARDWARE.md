@@ -61,12 +61,35 @@ trusting this blindly — treat as a starting point, not gospel.
 |---|---|
 | RX (device receives scanner data) | GPIO44 |
 | TX | -1 (not used — GM65 wired one-way into the ESP32) |
-| Baud | 9600 8N1 |
+| Baud | 9600 8N1 factory default, but see below — not the same on every unit |
 
 Legacy pins RX with `INPUT_PULLUP` before `Serial.begin`. Framing in legacy
-is line-oriented ASCII. v2's `scanner_gm65` driver only does UART framing,
-timeout, max-length, and physical duplicate-scan suppression — it does not
-parse business meaning from the payload (§26 of the task spec).
+is line-oriented ASCII, CR-terminated (`0x0D`, no LF observed). v2's
+`scanner_gm65` driver only does UART framing, timeout, max-length, and
+physical duplicate-scan suppression — it does not parse business meaning
+from the payload (§26 of the task spec).
+
+**Baud varies per physical unit, not just per firmware build.** The GM65's
+baud is a setting stored inside the module itself (its own EEPROM, changed
+via a factory-supplied setup barcode) — it is not something the firmware
+chooses, and a scan on the wrong baud produces total silence, not an error
+(a one-way RX UART has no failure signal to report). Confirmed live
+2026-08-30 on one unit: edge-capture + linear regression against a
+USB-Virtual-Serial-Port ground-truth readback of "WF|EMP|NV002" measured
+its module at 115200; 9600 produced zero bytes on that same unit's real
+hardware. A second unit in the fleet is confirmed still at the factory
+9600. Since one firmware build must serve every unit, `SCANNER_BAUD` in
+`hardware_pins.h` is only the compile-time default (used when a unit has
+never been told otherwise) — the value actually used at runtime is
+per-device NVS state (`ConfigStore::scanner_baud()`), provisioned live over
+the DEV serial console with no rebuild/reflash and no reboot needed:
+
+```text
+scanner-baud:<baud>   sets this unit's scanner UART baud and re-attaches
+                      it immediately (allow-list: 1200/2400/4800/9600/
+                      19200/38400/57600/115200 -- a typo is rejected, not
+                      silently persisted)
+```
 
 ## Touch — FT6336G, I2C (capacitive)
 

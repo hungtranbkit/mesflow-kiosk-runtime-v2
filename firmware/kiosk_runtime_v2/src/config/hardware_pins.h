@@ -17,6 +17,26 @@
 // --- Scanner: GM65, UART, one-way (RX only) ---
 #define PIN_SCANNER_RX 44
 #define PIN_SCANNER_TX -1  // GM65 wired one-way; TX not used
+// Compile-time DEFAULT only -- the GM65's own stored baud is a setting
+// inside the module itself (its EEPROM, set via a factory-supplied setup
+// barcode), not something this firmware controls, and it does NOT
+// necessarily match across physical units. Found live 2026-08-30 on one
+// unit: edge-capture + linear regression against a USB-Virtual-Serial-Port
+// ground-truth readback of "WF|EMP|NV002" measured its module at 115200,
+// not the GM65 datasheet's factory default of 9600 -- 9600 produced zero
+// bytes on that unit's real hardware (silent, no scan events at all, no
+// error either, since a one-way RX UART has no failure signal to report).
+// A second unit in the fleet is confirmed still at the factory 9600.
+//
+// One firmware build must work for both without a recompile per unit, so
+// this macro is only the fallback when a device has never been told
+// otherwise: the actual value used at runtime is
+// ConfigStore::scanner_baud() (persisted in NVS, per physical device,
+// defaults to 0 = "use this macro"), settable live via the DEV serial
+// command `scanner-baud:<baud>` (kiosk_runtime_v2.ino) -- no rebuild/
+// reflash needed to provision a unit whose module runs at a different
+// baud, and no reboot needed either (unlike wifi:/api-endpoint:, this
+// just re-attaches the UART).
 #define SCANNER_BAUD 9600
 
 // --- Touch: FT6336G, I2C --- (not driven in Phase 0, see docs/HARDWARE.md)

@@ -343,7 +343,14 @@ void setup() {
 #if MESFLOW_DEBUG_API
   kiosk::health::log_memory_snapshot("AFTER_DISPLAY_INIT");
 #endif
-  g_selftest.scanner_ok = g_scanner.init();
+  // 2026-09-08: per-device NVS override for the GM65's UART baud -- the
+  // module's own stored baud varies unit-to-unit (see hardware_pins.h's
+  // SCANNER_BAUD comment / ConfigStore::scanner_baud()'s doc). 0 means
+  // "never configured for this unit" -> fall back to the compile-time
+  // default so a fresh/factory unit works with no provisioning step.
+  long configured_scanner_baud = g_config.scanner_baud();
+  g_selftest.scanner_ok =
+      g_scanner.init(configured_scanner_baud != 0 ? configured_scanner_baud : SCANNER_BAUD);
 #if MESFLOW_DEBUG_API
   kiosk::health::log_memory_snapshot("AFTER_SCANNER_INIT");
 #endif
@@ -893,6 +900,23 @@ void poll_serial_provisioning() {
         // this has no automatic trigger).
         g_scanner.reinit();
         Serial.println("{\"level\":\"INFO\",\"code\":\"HW_SCANNER_REINIT_REQUESTED\",\"module\":\"kiosk_runtime_v2\"}");
+      } else if (line.startsWith("scanner-baud:")) {
+        // 2026-09-08: provisions THIS physical unit's GM65 module baud when
+        // it differs from the factory default (hardware_pins.h's
+        // SCANNER_BAUD) -- persisted per-device in NVS so one firmware
+        // build serves every unit regardless of what its own module is set
+        // to. Applies immediately, no reboot (unlike wifi:/api-endpoint:).
+        long baud = line.substring(13).toInt();
+        if (g_config.set_scanner_baud(baud)) {
+          g_scanner.set_baud(baud);
+          Serial.printf("{\"level\":\"INFO\",\"code\":\"CONFIG_SCANNER_BAUD_SET\","
+                        "\"module\":\"provisioning\",\"baud\":%ld}\n",
+                        baud);
+        } else {
+          Serial.println("Rejected: not a supported GM65 baud "
+                          "(1200/2400/4800/9600/19200/38400/57600/115200). "
+                          "Usage: scanner-baud:<baud>");
+        }
       } else if (line == "force-safe-mode") {
         // §9: forces the persisted same-fault streak to the SAFE_MODE
         // threshold and reboots -- verifies the REAL boot path (not just

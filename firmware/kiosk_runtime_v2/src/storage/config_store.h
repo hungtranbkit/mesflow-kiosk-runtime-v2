@@ -49,6 +49,24 @@ class ConfigStore {
   // write a partial/invalid config).
   kiosk::protocol::BackendUrlValidation set_api_endpoint(const String& url);
 
+  // 2026-09-08: the GM65 scanner's UART baud is a setting stored inside the
+  // module itself, not this firmware, and it does NOT necessarily match
+  // across physical units (found live: one unit's module was reconfigured
+  // to 115200 at some point, a second unit is still the factory 9600 --
+  // see hardware_pins.h's SCANNER_BAUD comment). One firmware build must
+  // serve both without a recompile per unit, so this is per-device NVS
+  // state, not a macro. 0 (the default, never configured) means "use
+  // hardware_pins.h's SCANNER_BAUD" -- callers must treat 0 as "unset",
+  // the same fail-safe-default convention as api_endpoint()'s "" above.
+  long scanner_baud();
+  // Only accepts a small allow-list of real GM65-supported bauds (never an
+  // arbitrary typed number) -- a wrong value here doesn't fail loudly like
+  // set_api_endpoint()'s URL validation does; it just makes the scanner go
+  // silent again with no error signal (one-way RX UART), so it's cheaper to
+  // reject nonsense here than to debug it live on hardware afterward.
+  // Returns false (and does not persist) if baud isn't in the allow-list.
+  bool set_scanner_baud(long baud);
+
  private:
   bool initialized_ = false;
 };

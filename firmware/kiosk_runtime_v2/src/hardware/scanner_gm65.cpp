@@ -5,9 +5,10 @@
 
 namespace kiosk::hardware {
 
-bool ScannerGm65::init() {
+bool ScannerGm65::init(long baud) {
+  baud_ = baud;
   pinMode(PIN_SCANNER_RX, INPUT_PULLUP);
-  serial_.begin(SCANNER_BAUD, SERIAL_8N1, PIN_SCANNER_RX, PIN_SCANNER_TX);
+  serial_.begin(baud_, SERIAL_8N1, PIN_SCANNER_RX, PIN_SCANNER_TX);
   buffer_.reserve(kMaxLineLength);
   return true;  // UART begin() has no failure signal to check on this core
 }
@@ -15,9 +16,18 @@ bool ScannerGm65::init() {
 void ScannerGm65::reinit() {
   buffer_ = "";  // drop whatever partial line was mid-flight -- it's stale after a UART re-attach
   serial_.end();
-  init();
+  init(baud_);
   kiosk::health::log_structured("INFO", "HW_SCANNER_REINIT", "scanner_gm65",
                                 "manual re-init (DEV serial command)");
+}
+
+void ScannerGm65::set_baud(long baud) {
+  buffer_ = "";
+  serial_.end();
+  init(baud);
+  char msg[48];
+  snprintf(msg, sizeof(msg), "baud changed to %ld", baud);
+  kiosk::health::log_structured("INFO", "HW_SCANNER_BAUD_CHANGED", "scanner_gm65", msg);
 }
 
 void ScannerGm65::poll() {

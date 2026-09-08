@@ -69,4 +69,26 @@ kiosk::protocol::BackendUrlValidation ConfigStore::set_api_endpoint(const String
   return kiosk::protocol::BackendUrlValidation::OK;
 }
 
+long ConfigStore::scanner_baud() {
+  prefs.begin(kNamespace, true);
+  long v = prefs.getLong("scanner_baud", 0);  // 0 = unset -> caller falls back to SCANNER_BAUD
+  prefs.end();
+  return v;
+}
+
+bool ConfigStore::set_scanner_baud(long baud) {
+  // Real GM65 datasheet-supported bauds, not an arbitrary range.
+  switch (baud) {
+    case 1200: case 2400: case 4800: case 9600:
+    case 19200: case 38400: case 57600: case 115200:
+      break;
+    default:
+      return false;
+  }
+  prefs.begin(kNamespace, false);
+  prefs.putLong("scanner_baud", baud);
+  prefs.end();
+  return true;
+}
+
 }  // namespace kiosk::storage
