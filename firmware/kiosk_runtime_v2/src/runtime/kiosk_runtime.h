@@ -320,6 +320,15 @@ class KioskRuntime {
   String pending_raw_code_;
   uint32_t consecutive_tcp_connect_fail_ = 0;  // see consecutive_tcp_connect_fail()'s own doc comment above
   uint32_t consecutive_request_failures_ = 0;  // see network_state()'s own doc comment above
+  // Field report (2026-09-08): renderer_.set_offline_queue_size() updates
+  // the IN-MEMORY value every poll() (cheap), but the STATUS BAR PIXELS
+  // only actually redraw when something else triggers a render -- on a
+  // genuinely idle kiosk (no scan, no state change) that can be minutes,
+  // so "Q:1" drawn once could sit on screen looking permanently stuck long
+  // after the real count already dropped back to 0. Tracked here so poll()
+  // can force a redraw the moment the COUNT itself changes, independent of
+  // any business-state transition.
+  uint32_t last_rendered_offline_queue_ = 0;
   // ONLINE is the correct initial value: matches classify_network_state()'s
   // own "no request yet" default, so the very first poll() never logs a
   // spurious "ONLINE -> ONLINE"-adjacent transition for a boot that hasn't

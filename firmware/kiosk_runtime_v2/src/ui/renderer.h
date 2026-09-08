@@ -321,6 +321,18 @@ class Renderer {
   // the SMALL-first path (used for anything that was never meant to be the
   // screen's single dominant instruction, e.g. a raw scanned code).
   void draw_fit_text(const String& text, int16_t y_top, uint16_t color, bool prefer_large);
+  // Field report (2026-09-08): the GOOD/DEFECT/REWORK_DECISION/REWORK/
+  // SUMMARY quantity-entry screens showed only the Operation, never WHO is
+  // entering -- on a shared kiosk, an operator had no on-screen way to
+  // confirm "this is really my session" before typing numbers into it
+  // (the exact scenario the same day's INTERRUPTED_QUANTITY_ENTRY backend
+  // exception exists for). One combined "<employee_name> · <operation_
+  // code>" line -- employee first (that's the actual new information),
+  // operation_code (not the longer operation_name) so this stays ONE line
+  // in the normal case, at the SAME y_top the operation-only line used to
+  // occupy on every one of those screens -- no other layout on any of them
+  // needed to move.
+  void draw_identity_line(const kiosk::protocol::ViewModel& view, int16_t y_top, uint16_t color);
   // The one emphasized-size helper, for the giant quantity-VALUE digit only
   // -- still conceptually FONT_LARGE (see kFontValueScale's own comment in
   // renderer.cpp), just drawn with extra visual weight. No other call site

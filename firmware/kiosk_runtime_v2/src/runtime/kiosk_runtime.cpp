@@ -1299,7 +1299,20 @@ void KioskRuntime::poll() {
   // §6/§18: keep the status bar's queue count current. Cheap (an in-memory
   // map-size read, journal_.counts()) -- fine to do every poll().
   auto journal_counts = journal_.counts();
-  renderer_.set_offline_queue_size(journal_counts.pending + journal_counts.in_flight);
+  uint32_t new_offline_queue = journal_counts.pending + journal_counts.in_flight;
+  renderer_.set_offline_queue_size(new_offline_queue);
+  // Field report (2026-09-08): force a redraw the moment this COUNT itself
+  // changes -- see last_rendered_offline_queue_'s own doc comment for why
+  // (an idle kiosk can otherwise show a stale "Q:N" for minutes after the
+  // real count already changed, with nothing else happening to trigger a
+  // render). Skipped while an error view or the finish-result hold screen
+  // owns the whole display -- those already redraw themselves on their own
+  // timeout/dismiss, and refresh_idle_screen() here would fight them for
+  // the screen instead of just quietly updating a corner of it.
+  if (new_offline_queue != last_rendered_offline_queue_) {
+    last_rendered_offline_queue_ = new_offline_queue;
+    if (!showing_error_view_ && !finish_result_hold_active_) refresh_idle_screen();
+  }
 
   // §8 field-log requirement: log every network_state() TRANSITION (not
   // every poll() -- that would flood the log for no reason), so a field

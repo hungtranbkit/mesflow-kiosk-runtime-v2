@@ -794,15 +794,20 @@ void Renderer::draw_business_state(const kiosk::protocol::StateSnapshot& s,
   end_screen();
 }
 
+void Renderer::draw_identity_line(const kiosk::protocol::ViewModel& view, int16_t y_top, uint16_t color) {
+  String emp = view.has_employee_name ? String(view.employee_name.c_str()) : String("");
+  String op_code = view.has_operation_code ? String(view.operation_code.c_str()) : String("");
+  String line = emp;
+  if (op_code.length() > 0) line += (emp.length() > 0 ? " · " : "") + op_code;
+  if (line.length() > 0) draw_fit_text(line, y_top, color, /*prefer_large=*/false);
+}
+
 void Renderer::draw_quantity_input_screen(const kiosk::protocol::ViewModel& view,
                                           const String& local_digit_buffer,
                                           const String& transient_message, bool is_error,
                                           WifiIndicator wifi) {
   begin_screen("state_quantity_input");
-  if (view.has_operation_name) {
-    draw_fit_text(String(view.operation_name.c_str()), kContentTop + kSpacingSmall, kColorMuted,
-                 /*prefer_large=*/false);
-  }
+  draw_identity_line(view, kContentTop + kSpacingSmall, kColorMuted);
   emit_component_text(centered_x("SỐ LƯỢNG TỐT", kFontSmall), 74, "SỐ LƯỢNG TỐT", kColorFg, kFontSmall);
   draw_value_giant(local_digit_buffer.length() > 0 ? local_digit_buffer : String("0"), 130, kColorAccent);
   if (transient_message.length() > 0) {
@@ -819,10 +824,7 @@ void Renderer::draw_quantity_defect_screen(const kiosk::protocol::ViewModel& vie
                                            const String& transient_message, bool is_error,
                                            WifiIndicator wifi) {
   begin_screen("state_quantity_defect");
-  if (view.has_operation_name) {
-    draw_fit_text(String(view.operation_name.c_str()), kContentTop + kSpacingSmall, kColorMuted,
-                 /*prefer_large=*/false);
-  }
+  draw_identity_line(view, kContentTop + kSpacingSmall, kColorMuted);
   emit_component_text(centered_x("SỐ LƯỢNG LỖI", kFontSmall), 74, "SỐ LƯỢNG LỖI", kColorErr, kFontSmall);
   char ref[24];
   snprintf(ref, sizeof(ref), "Đạt: %ld", static_cast<long>(good_so_far));
@@ -845,10 +847,7 @@ void Renderer::draw_rework_decision_screen(const kiosk::protocol::ViewModel& vie
                                            int32_t defect_so_far, const String& transient_message,
                                            bool is_error, WifiIndicator wifi) {
   begin_screen("state_rework_decision");
-  if (view.has_operation_name) {
-    draw_fit_text(String(view.operation_name.c_str()), kContentTop + kSpacingSmall, kColorMuted,
-                 /*prefer_large=*/false);
-  }
+  draw_identity_line(view, kContentTop + kSpacingSmall, kColorMuted);
   char ref[32];
   snprintf(ref, sizeof(ref), "Đạt: %ld   Lỗi: %ld", static_cast<long>(good_so_far),
            static_cast<long>(defect_so_far));
@@ -861,7 +860,11 @@ void Renderer::draw_rework_decision_screen(const kiosk::protocol::ViewModel& vie
   draw_title_2line("LỖI CÓ", "SỬA ĐƯỢC?", 128, kColorWarn);
 
   String opt1 = "1  CÓ";
-  String opt2 = "2  KHÔNG";
+  // Field report (2026-09-08): '#' now also confirms KHÔNG (see
+  // kiosk_runtime.cpp's REWORK_DECISION key handling for why) -- labeled
+  // here too so an operator who presses it out of habit sees it was a
+  // real, intentional choice, not a coincidence.
+  String opt2 = "2 / #  KHÔNG";
   emit_component_text(centered_x(opt1, kFontSmall), 226, opt1, kColorAccent, kFontSmall);
   emit_component_text(centered_x(opt2, kFontSmall), 250, opt2, kColorFg, kFontSmall);
 
@@ -878,10 +881,7 @@ void Renderer::draw_quantity_rework_screen(const kiosk::protocol::ViewModel& vie
                                            const String& transient_message, bool is_error,
                                            WifiIndicator wifi) {
   begin_screen("state_quantity_rework");
-  if (view.has_operation_name) {
-    draw_fit_text(String(view.operation_name.c_str()), kContentTop + kSpacingSmall, kColorMuted,
-                 /*prefer_large=*/false);
-  }
+  draw_identity_line(view, kContentTop + kSpacingSmall, kColorMuted);
   emit_component_text(centered_x("SỐ LƯỢNG SỬA", kFontSmall), 74, "SỐ LƯỢNG SỬA", kColorAccent, kFontSmall);
   char ref[32];
   snprintf(ref, sizeof(ref), "Tối đa: %ld", static_cast<long>(defect_so_far));
@@ -904,10 +904,7 @@ void Renderer::draw_quantity_summary_screen(const kiosk::protocol::ViewModel& vi
                                             int32_t rework, const String& transient_message, bool is_error,
                                             WifiIndicator wifi) {
   begin_screen("state_quantity_summary");
-  if (view.has_operation_name) {
-    draw_fit_text(String(view.operation_name.c_str()), kContentTop + kSpacingSmall, kColorMuted,
-                 /*prefer_large=*/false);
-  }
+  draw_identity_line(view, kContentTop + kSpacingSmall, kColorMuted);
   draw_title_2line("XÁC NHẬN", "SỐ LƯỢNG", 74, kColorAccent);
 
   char good_line[24];
