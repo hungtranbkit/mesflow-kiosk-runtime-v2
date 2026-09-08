@@ -855,7 +855,15 @@ void Renderer::draw_rework_decision_screen(const kiosk::protocol::ViewModel& vie
   // Fixed-format "label: number  label: number" -- fits on one SMALL line
   // in every realistic case; draw_fit_text's own wrap policy still protects
   // an extreme value from clipping.
-  draw_fit_text(ref_s, 60, kColorMuted, /*prefer_large=*/false);
+  //
+  // Real bug found live on hardware (2026-09-08 field report, screenshot):
+  // this used to sit at a fixed y=60, but the identity line right above it
+  // (draw_identity_line, employee_name + operation_code) can still wrap to
+  // a second small-font line for a long employee name -- that second line's
+  // own glyph extends past y=60, so the two overlapped. 74 matches the
+  // exact same spacing this codebase's own draw_quantity_input_screen()
+  // already uses safely just below.
+  draw_fit_text(ref_s, 74, kColorMuted, /*prefer_large=*/false);
 
   draw_title_2line("LỖI CÓ", "SỬA ĐƯỢC?", 128, kColorWarn);
 
@@ -947,11 +955,20 @@ void Renderer::draw_finish_result_screen(const String& employee_name, const Stri
   begin_screen("finish_result");
   draw_title_2line("HOÀN TẤT", "", 60, kColorAccent);
 
+  // Real bug found live on hardware (2026-09-08 field report, screenshot):
+  // employee_name used to be drawn at kContentTop+40 (=64), which sits
+  // INSIDE the "HOÀN TẤT" title's own glyph span (kFontLarge/24px native,
+  // drawn at y=60 -> occupies ~y60-84) -- both were rendered on top of
+  // each other. kContentTop (=24, the status-bar height) was never actually
+  // related to where this screen's own title is drawn (y=60, a value local
+  // to this function) -- fixed by anchoring off the title's real position/
+  // height (60 + kLineHeightLarge) instead of the unrelated constant.
   if (employee_name.length() > 0) {
-    draw_fit_text(employee_name, kContentTop + 40, kColorFg, /*prefer_large=*/false);
+    draw_fit_text(employee_name, 60 + kLineHeightLarge, kColorFg, /*prefer_large=*/false);
   }
   if (operation_code.length() > 0) {
-    draw_fit_text(operation_code, kContentTop + 66, kColorMuted, /*prefer_large=*/false);
+    draw_fit_text(operation_code, 60 + kLineHeightLarge + kLineHeightSmall, kColorMuted,
+                 /*prefer_large=*/false);
   }
 
   char good_line[24];

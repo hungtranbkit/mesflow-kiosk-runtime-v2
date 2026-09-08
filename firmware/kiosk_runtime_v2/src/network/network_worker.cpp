@@ -104,12 +104,25 @@ void NetworkWorker::begin() {
   low_queue_ = xQueueCreate(2, sizeof(NetworkRequest));
   result_mutex_ = xSemaphoreCreateMutex();
 
-  // 6144: same stack size this codebase's own per-call tasks already
-  // proved sufficient for an equivalent single HTTPClient POST (see
-  // api_client.cpp's own history) -- this task does the SAME work, just
-  // never exits. Priority 1 (same as the main loopTask) -- matches what
-  // the per-call tasks already ran at.
-  xTaskCreate(task_entry, "network_worker", 6144, this, 1, nullptr);
+  // 2026-09-08: 6144 (this task's original size, carried over from this
+  // codebase's older per-call HTTPClient tasks) is NOT enough -- confirmed
+  // on real hardware: "Stack canary watchpoint triggered (network_worker)"
+  // panics, reproduced twice independently against a real remote backend
+  // (once during a fresh device's very first bootstrap over https://, once
+  // during a plain http:// QUANTITY_SUBMITTED send mid-session), each time
+  // rebooting the device (durable journal + offline-replay meant no data
+  // was actually lost, but a live operator mid-scan seeing the kiosk
+  // spontaneously reboot is a real, disruptive bug). HTTPClient/WiFiClient
+  // (and WiFiClientSecure for https, which needs mbedTLS's own several-KB
+  // handshake buffers on top) keep meaningful state on THIS task's stack,
+  // not the heap -- 6144 bytes was never a safe margin for that, only
+  // "happened not to overflow yet" on the shorter/simpler requests this
+  // was last verified against. Bumped to 16384: heap headroom is not the
+  // constraint (int_free is consistently >150KB at runtime, see
+  // MEMORY_SNAPSHOT logs), so there is no reason to run this close to the
+  // edge. Priority 1 (same as the main loopTask) -- matches what the
+  // per-call tasks already ran at.
+  xTaskCreate(task_entry, "network_worker", 16384, this, 1, nullptr);
 }
 
 bool NetworkWorker::enqueue(NetworkPriorityTier tier, const NetworkRequest& req) {

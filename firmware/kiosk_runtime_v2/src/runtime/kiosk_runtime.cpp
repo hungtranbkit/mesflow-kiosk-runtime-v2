@@ -772,7 +772,10 @@ void KioskRuntime::handle_business_key(char key) {
         // defense in depth, not trusting the device alone.
         if (value > qty_defect_) {
           local_qty_buffer_.clear();
-          render_current_business_state("SỐ LƯỢNG SỬA KHÔNG ĐƯỢC LỚN HƠN SỐ LƯỢNG LỖI", true, false);
+          // 2026-09-08 field report: shortened from "SỐ LƯỢNG SỬA KHÔNG
+          // ĐƯỢC LỚN HƠN SỐ LƯỢNG LỖI" -- same meaning, drops the
+          // redundant "SỐ LƯỢNG" said twice.
+          render_current_business_state("SỬA KHÔNG ĐƯỢC LỚN HƠN LỖI", true, false);
           return;
         }
         qty_rework_ = value;
