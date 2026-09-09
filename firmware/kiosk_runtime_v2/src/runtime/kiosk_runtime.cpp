@@ -711,11 +711,28 @@ void KioskRuntime::handle_business_key(char key) {
     if (qty_step_ == QtyStep::REWORK_DECISION) {
       // Not a digit field -- a real Y/N choice, not overloaded onto */#/
       // digits, matching the task's own explicit "1 = CO, 2 = KHONG" ask.
+      //
+      // Field report (2026-09-09, caught live with an operator standing at
+      // the board pressing '#' eight times with nothing happening): the
+      // 2026-09-08 pass added "2 / #  KHÔNG" to draw_rework_decision_screen()
+      // and a comment there pointing HERE for the '#' handling -- but the
+      // branch below only ever tested '2', so '#' fell through to the bare
+      // `return` and did nothing at all. The screen promised a key the
+      // firmware ignored. Exactly the same class as this file's own
+      // already-documented dead "* XÓA" hint, and the reason that one is
+      // called out as misleading rather than harmless: on this screen the
+      // operator's only other exit is the '*'-hold recovery menu, so a
+      // wrong label doesn't just confuse, it strands the shift.
+      //
+      // '#' is safe to accept here precisely because this step has no digit
+      // entry -- there is no pending value for it to ambiguously "confirm",
+      // which is why it can carry its usual "confirm/continue" meaning
+      // without colliding with the digit-entry steps above.
       if (key == '1') {
         qty_step_ = QtyStep::REWORK;
         local_qty_buffer_.clear();
         render_current_business_state();
-      } else if (key == '2') {
+      } else if (key == '2' || key == '#') {
         qty_rework_ = 0;  // not repairable -> rework=0
         qty_step_ = QtyStep::SUMMARY;
         render_current_business_state();
