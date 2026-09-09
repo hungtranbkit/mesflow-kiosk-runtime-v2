@@ -329,6 +329,15 @@ class KioskRuntime {
   // can force a redraw the moment the COUNT itself changes, independent of
   // any business-state transition.
   uint32_t last_rendered_offline_queue_ = 0;
+  // Same problem, same fix, for the status-bar clock (2026-09-09): an idle
+  // kiosk can go minutes without a render (RECOVERY_UI_STALL's own 5-minute
+  // watchdog is proof this happens in the field), so a clock that only
+  // redraws when business events happen would sit visibly wrong -- worse
+  // than no clock. Holding the last DRAWN "HH:MM" lets poll() force exactly
+  // one redraw per minute boundary and none in between, which is also why
+  // this is the minute string and not a timestamp: comparing the rendered
+  // text is precisely the "did the visible pixels go stale" question.
+  String last_rendered_clock_text_;
   // ONLINE is the correct initial value: matches classify_network_state()'s
   // own "no request yet" default, so the very first poll() never logs a
   // spurious "ONLINE -> ONLINE"-adjacent transition for a boot that hasn't

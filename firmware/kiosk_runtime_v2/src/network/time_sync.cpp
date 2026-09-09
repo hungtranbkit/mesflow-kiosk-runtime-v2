@@ -86,4 +86,19 @@ String TimeSync::iso8601_now() const {
   return String(buf);
 }
 
+String TimeSync::local_hhmm() const {
+  if (status_ != kiosk::protocol::TimeSyncStatus::SYNCED &&
+      status_ != kiosk::protocol::TimeSyncStatus::STALE) {
+    return "";  // §17 again -- same trust gate as iso8601_now()
+  }
+  // Offset applied HERE, not via configTime(), so the underlying clock (and
+  // therefore every event timestamp and log line) stays UTC.
+  time_t local_epoch = time(nullptr) + TIME_SYNC_LOCAL_UTC_OFFSET_S;
+  struct tm tm_local;
+  gmtime_r(&local_epoch, &tm_local);
+  char buf[8];
+  strftime(buf, sizeof(buf), "%H:%M", &tm_local);
+  return String(buf);
+}
+
 }  // namespace kiosk::network
