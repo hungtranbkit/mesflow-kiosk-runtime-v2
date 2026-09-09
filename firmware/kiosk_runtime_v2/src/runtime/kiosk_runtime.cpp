@@ -87,7 +87,6 @@ bool KioskRuntime::apply_server_environment(const kiosk::network::BootstrapResul
 
   server_environment_ = environment_from_server_role(result.server_role.c_str());
   server_version_ = result.server_version;
-  renderer_.set_current_environment(server_environment_);  // §2/§6: status bar reads this on every render
 
   Environment expected = environment_from_config_string(config_.expected_environment().c_str());
   bool genuine_mismatch =
@@ -1315,6 +1314,32 @@ void KioskRuntime::poll() {
   if (new_offline_queue != last_rendered_offline_queue_) {
     last_rendered_offline_queue_ = new_offline_queue;
     if (!showing_error_view_ && !finish_result_hold_active_) refresh_idle_screen();
+  }
+
+  // Status-bar clock (2026-09-09), deliberately built on the exact same
+  // shape as the queue count directly above: keep the renderer's cached
+  // value current every poll() (cheap -- time_sync_ just reads the already-
+  // running system clock, no I/O), and force ONE redraw when the visible
+  // minute actually changes. "" while TimeSync doesn't trust the clock, in
+  // which case nothing ever changes and nothing is ever forced.
+  String clock_now = time_sync_.local_hhmm();
+  renderer_.set_clock_text(clock_now);
+  if (clock_now != last_rendered_clock_text_) {
+    last_rendered_clock_text_ = clock_now;
+    // Only ever forced from the genuinely IDLE screen. refresh_idle_screen()
+    // re-renders with an empty transient_message, so firing it on a minute
+    // boundary mid-interaction would silently wipe whatever the operator is
+    // currently being told ("Đang gửi...", "SỬA KHÔNG ĐƯỢC LỚN HƠN LỖI") --
+    // a once-a-minute race against the operator's own eyes. The queue-count
+    // refresh above can afford not to care because a COUNT change is rare
+    // and event-driven; a clock tick is neither. Every other state still
+    // gets a current clock on its next natural render, which during real
+    // work happens constantly anyway -- WAIT_EMPLOYEE is exactly the state
+    // where nothing else redraws and the clock is the point.
+    const bool idle_screen = state_projection_.has_snapshot() &&
+                             state_projection_.current().state ==
+                                 kiosk::protocol::BusinessState::WAIT_EMPLOYEE;
+    if (idle_screen && !showing_error_view_ && !finish_result_hold_active_) refresh_idle_screen();
   }
 
   // §8 field-log requirement: log every network_state() TRANSITION (not

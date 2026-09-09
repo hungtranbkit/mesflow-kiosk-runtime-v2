@@ -81,22 +81,33 @@ class Renderer {
   // render_current_business_state()) -- reason_code is whatever
   // kiosk::health::safe_mode_reason() returned (a RecoveryCode string, e.g.
   // "RECOVERY_TASK_CREATE_FAILED"), "" if none persisted.
-  // §2/§6/§25 (2026-08-26 UX-hardening pass): the environment label every
-  // main screen's status bar shows. Set once by KioskRuntime whenever a
-  // bootstrap resolves it (apply_server_environment()) and read internally
-  // by draw_status_bar() on every subsequent render -- deliberately NOT a
-  // parameter threaded through all 16 existing draw_status_bar() call
-  // sites (every screen function already calls it); this is the same
-  // "cache it as a member, drawn implicitly" shape wifi_indicator_ already
-  // uses one layer up in KioskRuntime.
-  void set_current_environment(kiosk::protocol::Environment env) { current_environment_ = env; }
+  // (2026-09-09) set_current_environment()/current_environment_ used to live
+  // here, feeding the status bar's DEV/TEST/PROD label. The header now shows
+  // the brand instead (see draw_status_bar()), which left that setter with
+  // no reader at all -- removed rather than kept as write-only state, the
+  // same call this codebase already made for RUNTIME_HTTP_HARD_DEADLINE_MS
+  // and friends. Environment is still rendered where it's acted on:
+  // draw_device_info_screen() and draw_server_mismatch_screen(), both of
+  // which take it as an explicit parameter and never needed the cache.
 
-  // §6/§18 (2026-08-26 UX-hardening pass): offline queue count, same
-  // cache-as-member/read-implicitly shape as set_current_environment()
-  // above. 0 means "nothing pending" -- draw_status_bar() only shows the
+  // §6/§18 (2026-08-26 UX-hardening pass): offline queue count, cached as a
+  // member and read implicitly by draw_status_bar() rather than threaded
+  // through all 16 of its call sites. 0 means "nothing pending" -- the
+  // status bar only shows the
   // "Q:N" suffix when this is nonzero, so a healthy device's status bar
   // never grows a permanent "Q:0" nobody needs to see.
   void set_offline_queue_size(uint32_t n) { offline_queue_size_ = n; }
+
+  // Operator wall clock in the status bar, "HH:MM" local time, or "" when
+  // the clock isn't trusted (TimeSync::local_hhmm()'s §17 gate) -- same
+  // cache-as-member/read-implicitly shape as the two setters above, for the
+  // same reason: draw_status_bar() already runs on every screen, threading
+  // a time parameter through all 16 call sites would buy nothing.
+  //
+  // The renderer never reads the clock itself: TimeSync owns the "is this
+  // time trustworthy" decision, and the UI layer must not be able to draw a
+  // confident-looking wall time the network layer wouldn't stand behind.
+  void set_clock_text(const String& hhmm) { clock_text_ = hhmm; }
 
   void draw_safe_mode_screen(const String& reason_code, WifiIndicator wifi);
 
@@ -292,8 +303,8 @@ class Renderer {
   DrawnComponent components_[kMaxComponents];
   int next_component_ = 0;
   bool qa_active_ = false;
-  kiosk::protocol::Environment current_environment_ = kiosk::protocol::Environment::UNKNOWN;
   uint32_t offline_queue_size_ = 0;
+  String clock_text_;  // "" until TimeSync trusts the clock -- see set_clock_text()
 
   // Draws a one-line Wi-Fi indicator at a fixed bottom row. Shared by every
   // "normal" screen so it's always visible, not something the operator has

@@ -23,6 +23,14 @@ constexpr uint16_t kColorErr = 0xF1EB;    // #F43F5E, matches the bundle palette
 // kColorErr -- §25 is explicit that color is never the ONLY signal, so
 // reusing existing named colors for those is correct, not a shortcut.
 constexpr uint16_t kColorDev = 0x653F;
+// Brand mark in the status bar (2026-09-09). #22D3EE (Tailwind cyan-400),
+// same hex-computed-RGB565 style as the tones above. Deliberately NOT one
+// of the existing named colors: green/yellow/red already MEAN ok/warn/error
+// on this screen, and a brand that borrows one of them would read as a
+// status the device isn't actually reporting. Cyan is unused by any signal
+// here, so it reads as identity, and it stays legible against the black
+// ground at 16px.
+constexpr uint16_t kColorBrand = 0x269D;
 
 uint16_t environment_color(kiosk::protocol::Environment e) {
   using kiosk::protocol::Environment;
@@ -304,43 +312,44 @@ void Renderer::emit_component_text(int16_t x, int16_t y, const String& text, uin
 // ==========================================================================
 
 void Renderer::draw_status_bar(WifiIndicator wifi) {
-  // §2/§6/§25 (2026-08-26 UX-hardening pass): environment label, far-left
-  // of the header -- the one thing every main screen must always show
-  // (§2: "Không dùng mỗi IP làm dấu hiệu environment"; §25: color is never
-  // the only signal, so the text itself is what actually satisfies this,
-  // the color is reinforcement). OFFLINE gets its own dedicated red text
-  // appended right after the label when disconnected, matching §6's
-  // "TEST · OFFLINE" example exactly rather than relying on the signal-bar
-  // icon alone to say so.
-  {
-    String env_text = kiosk::protocol::environment_to_string(current_environment_);
-    emit_component_text(kSpacingSmall, kSpacingSmall, env_text, environment_color(current_environment_),
-                        kFontSmall);
-    int16_t next_x = kSpacingSmall + static_cast<int>(measure_text_width(env_text, kFontSmall));
-    if (wifi == WifiIndicator::DISCONNECTED) {
-      String offline_text = " OFFLINE";
-      emit_component_text(next_x, kSpacingSmall, offline_text, kColorErr, kFontSmall);
-      next_x += static_cast<int>(measure_text_width(offline_text, kFontSmall));
-    }
-    // §6/§18: "Q:N" only while a real offline backlog exists -- never a
-    // permanent "Q:0" a healthy device would otherwise always show.
-    if (offline_queue_size_ > 0) {
-      String queue_text = " Q:" + String(offline_queue_size_);
-      emit_component_text(next_x, kSpacingSmall, queue_text, kColorWarn, kFontSmall);
-    }
-  }
-
-  // Graphical signal-bar icon, top-right corner. Three bars of increasing
-  // height, filled = on. This WifiIndicator enum has no per-dBm signal data
-  // (unlike legacy's RSSI-driven bar count), so it's a coarse approximation:
-  // CONNECTED=3 bars, CONNECTING=1 bar, DISCONNECTED/UNKNOWN=0 bars (outline
-  // only) -- honest about what's actually known, not a fabricated strength.
-  int bars_on = wifi == WifiIndicator::CONNECTED ? 3 : wifi == WifiIndicator::CONNECTING ? 1 : 0;
-  uint16_t bar_on_color = wifi == WifiIndicator::CONNECTED ? kColorAccent : kColorWarn;
+  // Header is three slots on ONE row -- brand (left), clock (center),
+  // link status (right) -- and nothing is ever allowed to overflow into a
+  // neighbour's slot. Each slot's x is derived from the real measured width
+  // of what it actually draws, never from an assumed character count.
   constexpr int16_t kIconRight = 234;
   constexpr int16_t kIconBaseY = kHeaderH - 4;  // 20 -- sits just above the header/content boundary
   constexpr int16_t kBarW = 5;
   constexpr int16_t kBarGapX = 7;
+  constexpr int16_t kLeftmostBarX = kIconRight - 3 * kBarGapX;  // 213
+
+  // ---- Left slot: brand ----
+  // Was the DEV/TEST/PROD environment label (§2/§6/§25 of the 2026-08-26
+  // UX-hardening pass). Replaced with the operator-facing brand on request
+  // (2026-09-09): the fleet's canonical backend is now a single production
+  // endpoint, so an always-on "TEST" was both wrong for the normal case and
+  // the loudest word on an otherwise calm screen. The environment is still
+  // shown where it's actually diagnosed -- Device Info (recovery menu
+  // option 6) and the full-screen server-mismatch takeover, which is the
+  // one case where a wrong environment must stop work entirely.
+  const String brand = "KIMEX";
+  emit_component_text(kSpacingSmall, kSpacingSmall, brand, kColorBrand, kFontSmall);
+  int16_t left_end = kSpacingSmall + static_cast<int16_t>(measure_text_width(brand, kFontSmall));
+  // §6/§18: "Q:N" only while a real offline backlog exists -- never a
+  // permanent "Q:0" a healthy device would otherwise always show.
+  if (offline_queue_size_ > 0) {
+    String queue_text = " Q:" + String(offline_queue_size_);
+    emit_component_text(left_end, kSpacingSmall, queue_text, kColorWarn, kFontSmall);
+    left_end += static_cast<int16_t>(measure_text_width(queue_text, kFontSmall));
+  }
+
+  // ---- Right slot: signal bars (fixed position) ----
+  // Three bars of increasing height, filled = on. This WifiIndicator enum
+  // has no per-dBm signal data (unlike legacy's RSSI-driven bar count), so
+  // it's a coarse approximation: CONNECTED=3 bars, CONNECTING=1 bar,
+  // DISCONNECTED/UNKNOWN=0 bars (outline only) -- honest about what's
+  // actually known, not a fabricated strength.
+  int bars_on = wifi == WifiIndicator::CONNECTED ? 3 : wifi == WifiIndicator::CONNECTING ? 1 : 0;
+  uint16_t bar_on_color = wifi == WifiIndicator::CONNECTED ? kColorAccent : kColorWarn;
   for (int i = 0; i < 3; ++i) {
     int16_t bar_h = 4 + i * 4;
     int16_t x = kIconRight - (3 - i) * kBarGapX;
@@ -355,19 +364,52 @@ void Renderer::draw_status_bar(WifiIndicator wifi) {
     display_.drawLine(kIconRight - 3 * kBarGapX, kIconBaseY - 12, kIconRight, kIconBaseY, kColorWarn);
   }
 
-  // SSID prefix: first 4 printable characters only (deliberate privacy/
-  // space bound, never the full SSID on the operator screen). "----" when
-  // disconnected/empty. FONT_SMALL, same as every other secondary text --
-  // no third size just because this lives in the header.
-  String ssid = wifi == WifiIndicator::DISCONNECTED || wifi == WifiIndicator::UNKNOWN
-                    ? String("") : WiFi.SSID();
-  String prefix = ssid.length() > 0 ? ssid.substring(0, ssid.length() < 4 ? ssid.length() : 4)
-                                     : String("----");
-  uint16_t w = measure_text_width(prefix, kFontSmall);
-  int16_t leftmost_bar_x = kIconRight - 3 * kBarGapX;
-  int16_t x = leftmost_bar_x - kSpacingSmall - static_cast<int>(w);
-  if (x < 0) x = 0;
-  emit_component_text(x, kSpacingSmall, prefix, kColorMuted, kFontSmall);
+  // ---- Right slot: one text field, immediately left of the bars ----
+  // Connected: SSID prefix, first 4 printable characters only (deliberate
+  // privacy/space bound, never the full SSID on the operator screen).
+  // Disconnected: the red OFFLINE word takes that same slot -- it used to be
+  // appended inline right after the left-hand label, which is exactly the
+  // "red text crowding into the top row" this row is meant not to do (§25
+  // still holds: the strike-through on the bars above means the colour is
+  // never the only signal).
+  const bool link_down = wifi == WifiIndicator::DISCONNECTED;
+  String right_text;
+  uint16_t right_color;
+  if (link_down) {
+    right_text = "OFFLINE";
+    right_color = kColorErr;
+  } else {
+    String ssid = wifi == WifiIndicator::UNKNOWN ? String("") : WiFi.SSID();
+    right_text = ssid.length() > 0 ? ssid.substring(0, ssid.length() < 4 ? ssid.length() : 4)
+                                   : String("----");
+    right_color = kColorMuted;
+  }
+  uint16_t right_w = measure_text_width(right_text, kFontSmall);
+  int16_t right_x = kLeftmostBarX - kSpacingSmall - static_cast<int>(right_w);
+  if (right_x < 0) right_x = 0;
+  emit_component_text(right_x, kSpacingSmall, right_text, right_color, kFontSmall);
+
+  // ---- Center slot: operator wall clock ----
+  // Drawn ONLY when it provably fits between the two slots above, measured
+  // at the real font -- a clock is a convenience, and silently overlapping
+  // the brand or the OFFLINE warning to show it would trade a real signal
+  // for a nice-to-have. In practice that means it's visible on every normal
+  // connected screen and steps aside for the wider OFFLINE word, which is
+  // also when the clock is least trustworthy anyway (no link -> no NTP
+  // refresh, so it can only be drifting further from real time).
+  //
+  // "--:--" rather than a blank gap when TimeSync doesn't trust the clock:
+  // an empty space reads as "this device has no clock", the dashes read as
+  // "the clock is not set yet", which is the true statement.
+  const String clock = clock_text_.length() > 0 ? clock_text_ : String("--:--");
+  const uint16_t clock_w = measure_text_width(clock, kFontSmall);
+  const int16_t clock_x = static_cast<int16_t>((kScreenW - static_cast<int>(clock_w)) / 2);
+  const bool clock_fits = clock_x >= left_end + kSpacingNormal &&
+                          clock_x + static_cast<int>(clock_w) <= right_x - kSpacingNormal;
+  if (clock_fits) {
+    emit_component_text(clock_x, kSpacingSmall, clock,
+                        clock_text_.length() > 0 ? kColorFg : kColorMuted, kFontSmall);
+  }
 }
 
 // One-line FONT_LARGE, centered. For a KNOWN short literal (not variable
@@ -1095,9 +1137,19 @@ void Renderer::draw_error_view(const String& message, bool is_network_error, Wif
   // rejection messages are already short human sentences, e.g. "Nhân viên
   // không hợp lệ" -- this renderer trusts that contract, it doesn't
   // re-validate it).
-  display_.fillRect(0, 0, kScreenW, kHeaderH + 8, kColorErr);
-  emit_component_text(kMarginX, kSpacingSmall, is_network_error ? "MẤT KẾT NỐI" : "LỖI", ILI9341_WHITE,
-                      kFontSmall);
+  // Field report (2026-09-09): this band used to start at y=0 and run to
+  // y=kHeaderH+8, i.e. straight through the status-bar row -- and
+  // draw_status_bar() runs AFTER it, so the brand/clock/Wi-Fi text was
+  // painted directly on top of this screen's own white title. Two different
+  // strings occupying the same pixels, on the one screen an operator most
+  // needs to be able to read. The band now starts BELOW the header, so the
+  // error owns its own row and the status bar keeps the top one:
+  // "cho xuống hàng dưới, đừng chen vào hàng trên cùng lại đè chữ tiêu đề".
+  constexpr int16_t kBandTop = kHeaderH;
+  constexpr int16_t kBandH = kHeaderH + 8;
+  display_.fillRect(0, kBandTop, kScreenW, kBandH, kColorErr);
+  emit_component_text(kMarginX, kBandTop + kSpacingSmall, is_network_error ? "MẤT KẾT NỐI" : "LỖI",
+                      ILI9341_WHITE, kFontSmall);
 
   draw_fit_text(message, 90, kColorErr, /*prefer_large=*/false);
 

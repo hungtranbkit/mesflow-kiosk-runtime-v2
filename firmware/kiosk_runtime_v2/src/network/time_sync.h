@@ -38,6 +38,13 @@ class TimeSync {
   // clock).
   String iso8601_now() const;
 
+  // "HH:MM" in LOCAL time (TIME_SYNC_LOCAL_UTC_OFFSET_S) for the operator
+  // clock in the status bar, or "" if the clock isn't trusted -- the same
+  // §17 rule iso8601_now() follows, for the same reason: a wrong wall clock
+  // on a factory-floor screen is worse than a visibly absent one, because
+  // an operator will believe it. The caller draws "--:--" for "".
+  String local_hhmm() const;
+
  private:
   kiosk::protocol::TimeSyncStatus status_ = kiosk::protocol::TimeSyncStatus::UNSYNCED;
   unsigned long last_sync_uptime_ms_ = 0;

@@ -172,6 +172,14 @@
 #define TIME_SYNC_STALE_AFTER_S (24u * 3600u)
 // How often to retry NTP if it hasn't succeeded yet.
 #define TIME_SYNC_RETRY_INTERVAL_MS 60000
+// DISPLAY-ONLY local-time offset for the operator clock in the status bar
+// (Asia/Ho_Chi_Minh, UTC+7, no DST anywhere in Vietnam -- a fixed offset is
+// correct here, not a simplification). Deliberately NOT applied to
+// configTime(): the device clock itself stays UTC so iso8601_now(), event
+// timestamps and every log line keep the exact §16/§17 semantics they
+// already have. This constant is read by exactly one function
+// (TimeSync::local_hhmm(), the status-bar clock) and nothing else.
+#define TIME_SYNC_LOCAL_UTC_OFFSET_S (7 * 3600)
 
 // --- Heartbeat (§43/§44) ---
 #define HEARTBEAT_INTERVAL_MS 20000
