@@ -426,6 +426,21 @@ void Renderer::draw_title_2line(const String& line1, const String& line2, int16_
   draw_title_line(line2, y_top + kLineHeightLarge, color);
 }
 
+// The one place that decides what a truncated string looks like. Bounded:
+// at most len(text) iterations, and never returns something wider than
+// max_w unless a single character plus the ellipsis already exceeds it
+// (in which case there is no honest way to show that string at all here).
+String Renderer::ellipsize_to_width(const String& text, uint8_t font_size, int16_t max_w) {
+  if (text.length() == 0 || max_w <= 0) return String("");
+  if (measure_text_width(text, font_size) <= static_cast<uint16_t>(max_w)) return text;
+  String line = text;
+  while (line.length() > 1 &&
+         measure_text_width(line + "...", font_size) > static_cast<uint16_t>(max_w)) {
+    line = line.substring(0, line.length() - 1);
+  }
+  return line + "...";
+}
+
 // Shared word-wrap-into-at-most-2-lines-then-ellipsize algorithm (2026-08-25
 // bundle-text-clip fix: factored out of draw_fit_text() so draw_from_bundle()
 // can apply the same policy at an arbitrary font_size, not just kFontSmall).
@@ -458,17 +473,8 @@ void Renderer::wrap_and_ellipsize_two_lines(const String& text, uint8_t font_siz
     line1 = remaining;
     line2 = "";
   }
-  auto ellipsize_if_needed = [&](String& line) {
-    if (line.length() == 0 || measure_text_width(line, font_size) <= static_cast<uint16_t>(max_w)) return;
-    // Trim to fit + ellipsis, character by character (bounded: len(line) iterations max).
-    while (line.length() > 1 &&
-           measure_text_width(line + "...", font_size) > static_cast<uint16_t>(max_w)) {
-      line = line.substring(0, line.length() - 1);
-    }
-    line += "...";
-  };
-  ellipsize_if_needed(line1);
-  ellipsize_if_needed(line2);
+  line1 = ellipsize_to_width(line1, font_size, max_w);
+  line2 = ellipsize_to_width(line2, font_size, max_w);
   *out_line1 = line1;
   *out_line2 = line2;
 }
@@ -689,11 +695,41 @@ void Renderer::draw_device_info_screen(kiosk::protocol::Environment environment,
                                        WifiIndicator wifi) {
   begin_screen("device_info");
   constexpr int16_t kLabelX = 8;
+
+  // Real bug found live on hardware (2026-09-09 field report, serial):
+  // three rows overflowed the 240px panel -- "Server : <url>" measured 354px
+  // against 240 available, "HW ID" 261px, "Last sync" 249px. This screen
+  // built each row as `label + value` and handed it straight to
+  // emit_component_text(), the one draw path with NO fit policy at all, so
+  // a long value simply ran off the right edge. The Server row is the worst
+  // one to lose: it is the row a technician opens this screen to READ.
+  //
+  // It overflowed vertically too, quietly: 12 rows at kLineHeightSmall from
+  // y=28 put the last row's glyphs at y=270-289, straight through the
+  // footer divider at y=286.
+  //
+  // Both fixed by treating this as what it is -- a dense technical readout
+  // for a technician holding the device, the same class as the boot screen,
+  // which emit_line() already lets drop to the 12px font for exactly this
+  // reason ("last-resort shrink for the few long diagnostic lines"). That
+  // is a font-LAYER fallback for diagnostic screens, not a third
+  // typographic role in the normal operator UI, so the two-size rule for
+  // workflow screens still holds.
+  constexpr uint8_t kInfoFont = 1;      // 12px native -- diagnostic screens only
+  constexpr int16_t kInfoLineHeight = 18;
+  constexpr int16_t kInfoMaxW = kScreenW - kLabelX - kMarginX;
+
   int16_t y = kContentTop + kSpacingSmall;
   auto row = [&](const String& label, const String& value, uint16_t value_color) {
-    String line = label + value;
-    emit_component_text(kLabelX, y, line, value_color, kFontSmall);
-    y += kLineHeightSmall;
+    // Only the VALUE is ever truncated -- the label is what tells the
+    // technician which field they are looking at, so trimming the whole
+    // concatenated line (which is what overflowed before) could leave a row
+    // whose meaning is unreadable while its data is intact.
+    const int16_t value_max_w =
+        kInfoMaxW - static_cast<int16_t>(measure_text_width(label, kInfoFont));
+    const String shown = ellipsize_to_width(value, kInfoFont, value_max_w);
+    emit_component_text(kLabelX, y, label + shown, value_color, kInfoFont);
+    y += kInfoLineHeight;
   };
   row("Env      : ", kiosk::protocol::environment_to_string(environment), environment_color(environment));
   row("Server   : ", server_endpoint.length() > 0 ? server_endpoint : String("(chưa cấu hình)"), kColorFg);
