@@ -404,6 +404,14 @@ class Renderer {
   // with no such space (one unbreakable token wider than the screen),
   // line1=text/line2="" and line1 alone gets ellipsized. Both output lines
   // are ellipsized independently if they still don't fit after the split.
+  // Single-line fit policy: return `text` unchanged if it already fits,
+  // otherwise trim it character by character and append "..." until it
+  // does. The ONE place that decides what a truncated string looks like --
+  // wrap_and_ellipsize_two_lines() below and the fixed-row Device Info
+  // screen both call it rather than each growing their own trimming loop
+  // that could drift from the other.
+  String ellipsize_to_width(const String& text, uint8_t font_size, int16_t max_w);
+
   void wrap_and_ellipsize_two_lines(const String& text, uint8_t font_size, int16_t max_w,
                                     String* out_line1, String* out_line2);
   // Call once a screen is fully drawn -- bumps Display's frame_id so a
